@@ -1,0 +1,14 @@
+# Python dependencies for tools/equipment_ocr_submitter.py.
+#
+# System dependencies still need to be installed separately:
+#   macOS/Homebrew: brew install tesseract android-platform-tools
+#   Playwright browser: python -m playwright install chromium
+#
+# Optional but recommended for website automation on macOS:
+#   Chrome > View > Developer > Allow JavaScript from Apple Events
+
+Pillow>=10.0.0
+mss>=9.0.1
+playwright>=1.45.0
+pytesseract>=0.3.10
+pyautogui>=0.9.54

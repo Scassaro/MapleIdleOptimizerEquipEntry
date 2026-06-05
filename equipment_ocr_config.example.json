@@ -1,0 +1,382 @@
+{
+  "debug_dir": "equipment_ocr_debug/latest",
+  "stop_on_duplicate_image": false,
+  "skip_duplicate_parsed_equipment": true,
+  "capture": {
+    "backend": "adb",
+    "adb_path": "adb",
+    "connect": "127.0.0.1:5555",
+    "serial": "127.0.0.1:5555",
+    "timeout_seconds": 20,
+    "crop": [1185, 160, 700, 1180],
+    "regions": [
+      {
+        "name": "candidate",
+        "role": "primary",
+        "description": "Right/new equipment item in the comparison popover. This is the item submitted to the analyzer.",
+        "primary": true,
+        "crop": [1185, 160, 700, 1180]
+      },
+      {
+        "name": "equipped",
+        "role": "equipped",
+        "description": "Left/currently equipped item in the comparison popover. This is saved for reference, not submitted by default.",
+        "attach_as": "equipped_item",
+        "crop": [485, 160, 705, 1090]
+      }
+    ]
+  },
+  "ocr": {
+    "engine": "tesseract-cli",
+    "language": "eng",
+    "psm": 6,
+    "scale": 2.0,
+    "grayscale": true,
+    "contrast": 1.6,
+    "autocontrast": true,
+    "sharpen": true,
+    "threshold": null,
+    "extra_args": ""
+  },
+  "normalize": {
+    "collapse_spaces": true,
+    "drop_empty_lines": true,
+    "replacements": [
+      {
+        "pattern": "CRI[TI]*CAL",
+        "replace": "CRITICAL",
+        "ignore_case": true
+      },
+      {
+        "pattern": "ATK",
+        "replace": "Attack",
+        "ignore_case": true
+      },
+      {
+        "pattern": "(?m)^\\W*ack\\b",
+        "replace": "Attack",
+        "ignore_case": true
+      },
+      {
+        "pattern": "(?m)^\\W*x\\s+HP\\b",
+        "replace": "Max HP",
+        "ignore_case": true
+      }
+    ]
+  },
+  "parser": {
+    "keep_lines": true,
+    "keep_stat_rows": true,
+    "default_tier": null,
+    "default_tier_by_slot": {
+      "Shoes": 4
+    },
+    "stat_aliases": {
+      "attack": ["\\bAttack\\b", "\\bAtk\\b", "^\\W*ack\\b"],
+      "hp": ["\\bMax\\s*HP\\b", "\\bHP\\b", "^\\W*x\\s+HP\\b"],
+      "mp": ["\\bMax\\s*MP\\b", "\\bMP\\b"],
+      "defense": ["\\bDefen[cs]e\\b", "\\bDEF\\b"],
+      "accuracy": ["\\bHit\\s*Chance\\b", "\\bAccuracy\\b"],
+      "avoidance": ["\\bAvoid\\w*\\b", "\\bEvasion\\b"],
+      "boss_damage": ["\\bBoss\\b", "\\bBoss\\s*(?:Damage|DMG)\\b"],
+      "critical_rate": ["\\bCrit(?:ical)?\\s*(?:Rate|Chance)\\b"],
+      "critical_damage": ["\\bCrit(?:ical)?\\s*(?:Damage|DMG|Power)\\b"],
+      "final_damage": ["\\bFinal\\s*(?:Damage|DMG)\\b"],
+      "main_stat": ["\\bAny\\s*Stat\\b", "\\bAll\\s*Stat\\b", "\\bMain\\s*Stat\\b"]
+    },
+    "fields": [
+      {
+        "name": "item_name",
+        "regexes": [
+          "^\\W*(?P<value>[A-Z][A-Za-z0-9' -]+(?:Boots|Shoes|Cap|Hat|Gloves|Overall|Cape|Belt|Shoulder|Ring|Pendant|Medal|Sword|Axe|Bow|Staff|Wand|Dagger|Cane|Gun|Knuckle|Claw|Spear|Polearm|Katara|Weapon))\\W*$",
+          "^(?P<value>[^\\n]+)"
+        ],
+        "type": "text",
+        "default": ""
+      },
+      {
+        "name": "grade",
+        "regex": "\\b(?P<value>Common|Rare|Epic|Unique|Legendary|Mythic|Ancient|gendary|egendary)\\b",
+        "type": "text",
+        "transforms": {
+          "gendary": "Legendary",
+          "egendary": "Legendary"
+        },
+        "default": ""
+      },
+      {
+        "name": "tier",
+        "regex": "\\b(?:Tier|T)\\s*[:.+-]?\\s*(?P<value>\\d+)\\b",
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "level",
+        "regex": "\\b(?:Level|Lv\\.?|Enhance)\\s*\\+?(?P<value>\\d+)\\b",
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "attack",
+        "regexes": [
+          "(?:^|\\n)[^\\n]*(?:Attack|Atk|ack)[ \\t:|+]*(?P<value>[0-9,]+(?:\\.[0-9]+)?)\\b",
+          "(?:^|\\n)[^\\n]*?(?P<value>[0-9,]+(?:\\.[0-9]+)?)[ \\t%|]+(?:Attack|Atk|ack)\\b"
+        ],
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "hp",
+        "regexes": [
+          "(?:^|\\n)[^\\n]*(?:Max[ \\t]+)?HP[ \\t:|+]*(?P<value>[0-9,]+)\\b",
+          "(?:^|\\n)[^\\n]*?(?P<value>[0-9,]+)[ \\t|]+(?:Max[ \\t]+)?HP\\b"
+        ],
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "mp",
+        "regex": "\\b(?:Max[ \\t]+)?MP\\s*\\+?(?P<value>[0-9,]+)",
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "defense",
+        "regex": "\\b(?:Defense|Defence|DEF)\\s*\\+?(?P<value>[0-9,]+)",
+        "type": "int",
+        "default": null
+      },
+      {
+        "name": "accuracy",
+        "regex": "\\b(?:Hit Chance|Accuracy)\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "avoidance",
+        "regex": "\\b(?:Avoid Chance|Avoidance|Evasion)\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "critical_rate",
+        "regex": "\\bCrit(?:ical)?(?: Rate| Chance)?\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "critical_damage",
+        "regex": "\\bCrit(?:ical)?(?: Damage| DMG| Power)\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "boss_damage",
+        "regex": "\\bBoss(?: Damage| DMG)?\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "final_damage",
+        "regex": "\\bFinal(?: Damage| DMG)\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      },
+      {
+        "name": "main_stat",
+        "regex": "\\b(?:Any Stat|All Stat|Main Stat)\\s*\\+?(?P<value>[0-9.]+)\\s*%?",
+        "type": "percent",
+        "default": null
+      }
+    ]
+  },
+  "website": {
+    "url": "https://mirpg-optimizer.netlify.app/equipment",
+    "automation_mode": "mirpg_optimizer",
+    "driver": "chrome_applescript",
+    "allow_browser_launch": false,
+    "browser": "chromium",
+    "browser_channel": null,
+    "executable_path": null,
+    "connect_over_cdp_url": null,
+    "navigate_active_tab": false,
+    "close_cdp_browser": false,
+    "close_browser_on_exit": false,
+    "launch_args": [],
+    "headless": false,
+    "manual_login": true,
+    "user_data_dir": null,
+    "applescript_timeout_seconds": 20,
+    "applescript_poll_interval_seconds": 0.25,
+    "viewport": {
+      "width": 1440,
+      "height": 1000
+    },
+    "wait_until": "domcontentloaded",
+    "skip_empty_fields": true,
+    "select_slot_tab": true,
+    "top_level_slot_button_selector": "button",
+    "top_level_slot_max_y": 520,
+    "use_current_editor": false,
+    "reuse_empty_sub_option_row": true,
+    "skip_known_unsupported_effects": true,
+    "wait_after_add_equipment_seconds": 0.5,
+    "editor_selector_candidates": [
+      "div:has-text('MAIN OPTION'):has-text('SUB OPTION'):has(button:has-text('+ Add'))",
+      "section:has-text('MAIN OPTION'):has-text('SUB OPTION'):has(button:has-text('+ Add'))",
+      "form:has-text('MAIN OPTION'):has-text('SUB OPTION'):has(button:has-text('+ Add'))"
+    ],
+    "before_each_selector": null,
+    "field_selectors": {
+      "equipment_name": "#item-name",
+      "on_equip_effects": "#effects-json",
+      "raw_text": "#raw-ocr"
+    },
+    "submit_selector": "button[type='submit']",
+    "wait_after_submit_seconds": 0.5
+  },
+  "advance": {
+    "mode": "item_grid",
+    "input_backend": "adb",
+    "adb_input_transport": "auto",
+    "calibrate_first_item_on_start": false,
+    "calibration_item_position_index": 0,
+    "runtime_calibration_delay_seconds": 3.0,
+    "desktop_coordinate_offset": [0, 0],
+    "desktop_coordinate_scale": 1.0,
+    "desktop_move_before_click_seconds": 0.2,
+    "movement_snapshots": {
+      "backend": "adb",
+      "monitor": 1,
+      "crop": null,
+      "capture_before_click": true,
+      "click_capture_mode": "after_click",
+      "click_hold_seconds": 0.18,
+      "after_action_delay_seconds": 0.04,
+      "capture_wait_actions": true
+    },
+    "detect_items": {
+      "input_backend": "adb",
+      "three_point_calibration": true,
+      "calibration_uniform_scale": false,
+      "skip_seen_cards": true,
+      "skip_seen_rows_after_scroll": 2,
+      "skip_seen_rows_after_crawl_scroll": 1,
+      "skip_seen_min_matches_per_row": 2,
+      "log_detected_items": false,
+      "min_new_cards_after_scroll": 1,
+      "max_extra_scrolls_per_page": 3,
+      "max_all_pages": 200,
+      "signature_inset_px": 12,
+      "signature_resize": [32, 32],
+      "signature_hamming_threshold": 55,
+      "signature_color_distance_threshold": 90,
+      "row_snap_after_scroll": false,
+      "row_group_tolerance_px": 35,
+      "row_snap_tolerance_px": 8,
+      "row_snap_max_match_delta_px": 95,
+      "row_snap_max_correction_px": 80,
+      "row_snap_attempts": 1,
+      "row_snap_duration_ms": 450,
+      "row_snap_hold_seconds_before": 0.08,
+      "row_snap_pause_before_release_seconds": 0.12,
+      "row_snap_steps": 8,
+      "row_snap_anchor": [2205, 740],
+      "region": [1900, 240, 585, 1000],
+      "max_items_per_page": 15,
+      "min_card_width": 120,
+      "max_card_width": 230,
+      "min_card_height": 120,
+      "max_card_height": 230,
+      "min_component_pixels": 2500,
+      "min_center_distance": 45,
+      "page_scroll_actions": [
+        {
+          "type": "adb_swipe",
+          "from_x": 2205,
+          "from_y": 1110,
+          "to_x": 2205,
+          "to_y": 350,
+          "duration_ms": 1600,
+          "hold_seconds_before": 0.15,
+          "pause_before_release_seconds": 0.35,
+          "steps": 12
+        },
+        {
+          "type": "wait",
+          "seconds": 0.3
+        }
+      ],
+      "all_items_scroll_actions": [
+        {
+          "type": "adb_swipe",
+          "from_x": 2205,
+          "from_y": 1010,
+          "to_x": 2205,
+          "to_y": 640,
+          "duration_ms": 850,
+          "hold_seconds_before": 0.08,
+          "pause_before_release_seconds": 0.12,
+          "steps": 8
+        },
+        {
+          "type": "wait",
+          "seconds": 0.25
+        }
+      ]
+    },
+    "wait_after_advance_seconds": 0.2,
+    "adb_retries": 3,
+    "adb_retry_delay_seconds": 0.8,
+    "adb_disconnect_before_reconnect": true,
+    "adb_reconnect_delay_seconds": 0.5,
+    "adb_restart_server_on_retry": true,
+    "adb_restart_server_after_retry": 2,
+    "item_positions": [
+      [160, 250],
+      [160, 360],
+      [160, 470],
+      [160, 580],
+      [160, 690]
+    ],
+    "post_scroll_item_positions": [
+      [160, 250],
+      [160, 360],
+      [160, 470],
+      [160, 580],
+      [160, 690]
+    ],
+    "scroll_actions": [
+      {
+        "type": "adb_swipe",
+        "from_x": 180,
+        "from_y": 720,
+        "to_x": 180,
+        "to_y": 260,
+        "duration_ms": 550
+      },
+      {
+        "type": "wait",
+        "seconds": 0.5
+      }
+    ],
+    "page_scroll_actions": [
+      {
+        "type": "adb_swipe",
+        "from_x": 180,
+        "from_y": 720,
+        "to_x": 180,
+        "to_y": 170,
+        "duration_ms": 1600,
+        "hold_seconds_before": 0.15,
+        "pause_before_release_seconds": 0.35,
+        "steps": 12
+      },
+      {
+        "type": "wait",
+        "seconds": 0.8
+      }
+    ],
+    "reset_position_after_scroll": [160, 690]
+  }
+}
