@@ -47,7 +47,7 @@ adb connect 127.0.0.1:5555
 adb -s 127.0.0.1:5555 exec-out screencap -p >/tmp/mirpg_adb_test.png
 ```
 
-If `exec-out screencap` fails with `error: closed`, fix/restart the BlueStacks ADB bridge before running OCR capture or ADB movement snapshots.
+If `exec-out screencap` fails with `error: closed`, fix/restart the BlueStacks ADB bridge before running OCR capture or ADB movement snapshots. Also verify that ADB is enabled on Bluestacks.
 
 ## Useful Run Commands
 
