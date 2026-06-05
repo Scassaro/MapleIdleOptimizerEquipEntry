@@ -5,7 +5,6 @@ This installs the dependencies for `tools/equipment_ocr_submitter.py`.
 ## macOS Install
 
 ```bash
-cd /Users/Stephen.Cassaro/Documents/Playground
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements-equipment-automation.txt
@@ -16,7 +15,6 @@ brew install tesseract android-platform-tools
 ## Verify
 
 ```bash
-cd /Users/Stephen.Cassaro/Documents/Playground
 .venv/bin/python -c "import PIL, mss, playwright, pyautogui, pytesseract; print('python deps ok')"
 tesseract --version
 adb version
