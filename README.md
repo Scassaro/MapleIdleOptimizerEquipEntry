@@ -51,7 +51,8 @@ If `exec-out screencap` fails with `error: closed`, fix/restart the BlueStacks A
 
 Note: all commands can be run with a "--dry-run" flag to just step through what will be performed without making changes on MIRPG (some dry runs work better than others at this point).
 
-Submit Gear List
+## Submit Gear List
+
 Use this when you are entering items from the game’s right-side Manage Equipment list. This flow lets you choose where each visible page starts, then the script clicks and submits that item plus the remaining items to the right and below it. Manually scrolls for now, as scrolling programmatically is difficult with the momentum scrolling.
 
 .venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --submit-gear-list
@@ -67,7 +68,8 @@ How to use it:
 7. When prompted again, manually scroll the game list to the next page.
 8. Repeat until done, or type q at the prompt to stop.
 
-Submit Equipped Slots
+## Submit Equipped Slots
+
 Use this when you want to save the currently equipped items shown on the character/equipment screen’s left-side equipped slots.
 
 .venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --submit-equipped-slots
@@ -81,7 +83,8 @@ How to use it:
 5. Click the top-left equipped item in the game (Helm).
 6. The script uses that click to calibrate the slot positions, submits that first item, then taps/submits the remaining equipped slots.
 
-Unequip Website Items
+## Unequip Website Items
+
 Use this when you want MIRPG Optimizer to clear the currently equipped comparison item for every equipment category. This is website-only and does not interact with the game.
 
 .venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --unequip-website
@@ -93,7 +96,8 @@ How to use it:
 3. Run the command.
 4. The script clicks each equipment category on the website and clicks Unequip on the left/equipped comparison item if one exists.
 
-Dismantle Website Items
+## Dismantle Website Items
+
 Use this when you want to remove saved items from MIRPG Optimizer’s Manage Equipment list. This is website-only and does not interact with the game.
 
 .venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --dismantle-website
