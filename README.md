@@ -49,64 +49,60 @@ If `exec-out screencap` fails with `error: closed`, fix/restart the BlueStacks A
 
 ## Useful Run Commands
 
-Dry-run OCR only:
+Note: all commands can be run with a "--dry-run" flag to just step through what will be performed without making changes on MIRPG (some dry runs work better than others at this point).
 
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --limit 1 --dry-run
-```
+Submit Gear List
+Use this when you are entering items from the game’s right-side Manage Equipment list. This flow lets you choose where each visible page starts, then the script clicks and submits that item plus the remaining items to the right and below it. Manually scrolls for now, as scrolling programmatically is difficult with the momentum scrolling.
 
-Test one advance action:
+.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --submit-gear-list
 
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --advance-only 0
-```
+How to use it:
 
-Tap a full visible page, scroll once, then tap the next page:
+1. Open MIRPG Optimizer to the Equipment page and leave it logged in.
+2. In MapleIdle, open Preset -> Edit Preset (Ideally basic preset)
+3. Run the command.
+4. When prompted, press Enter.
+5. Click the first item in the "Manage Equipment" scrollable table you want the script to process on the current visible page.
+6. Wait while it submits that item and every later visible item.
+7. When prompted again, manually scroll the game list to the next page.
+8. Repeat until done, or type q at the prompt to stop.
 
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --tap-page-test 2
-```
+Submit Equipped Slots
+Use this when you want to save the currently equipped items shown on the character/equipment screen’s left-side equipped slots.
 
-Detect visible item cards from ADB screenshots, tap those detected centers, scroll once, then detect/tap the next page:
+.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --submit-equipped-slots
 
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --tap-detected-page-test 2
-```
+How to use it:
 
-Detect and tap every visible/new item, scrolling until no unseen cards remain:
+1. Open MIRPG Optimizer to the Equipment page and leave it logged in.
+2. In MapleIdle, open Preset -> Edit Preset (Ideally basic preset)
+3. Run the command.
+4. When prompted, press Enter.
+5. Click the top-left equipped item in the game (Helm).
+6. The script uses that click to calibrate the slot positions, submits that first item, then taps/submits the remaining equipped slots.
 
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --tap-detected-all-test
-```
+Unequip Website Items
+Use this when you want MIRPG Optimizer to clear the currently equipped comparison item for every equipment category. This is website-only and does not interact with the game.
 
-Add `--movement-snapshots` only when debugging click/scroll behavior; it captures extra ADB screenshots and slows the run down.
+.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --unequip-website
 
-With the example config, game-side automation uses ADB for capture, taps, scrolls, and detected-card centers. No hover calibration is needed. If you switch `advance.input_backend` or `advance.detect_items.input_backend` back to `desktop`, the command asks for calibration hovers because it must map ADB screenshot coordinates to Mac screen coordinates.
+How to use it:
 
-The detected-page test also fingerprints each visible card. If a scroll lands with overlap, already-clicked cards are skipped only in the first `advance.detect_items.skip_seen_rows_after_scroll` visible rows; matching cards below those rows are still clicked and logged as `seen_match_ignored`. If a scroll shows no new cards, the script will try another scroll up to `advance.detect_items.max_extra_scrolls_per_page`.
+1. Open MIRPG Optimizer to the Equipment page.
+2. Keep that Chrome tab active while the command runs.
+3. Run the command.
+4. The script clicks each equipment category on the website and clicks Unequip on the left/equipped comparison item if one exists.
 
-The all-items test stops when scrolling no longer reveals unseen cards. `advance.detect_items.max_all_pages` is a safety cap to prevent an accidental infinite run.
+Dismantle Website Items
+Use this when you want to remove saved items from MIRPG Optimizer’s Manage Equipment list. This is website-only and does not interact with the game.
 
-The all-items test uses `advance.detect_items.all_items_scroll_actions`, a smaller overlapping crawl scroll, instead of the larger fixed-page scroll. This is slower than a full-page jump but much less likely to miss cards over a long inventory.
+.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --dismantle-website
 
-Row snapping is available but disabled by default for speed now that ADB taps use exact screenshot centers. Set `advance.detect_items.row_snap_after_scroll` to `true` only if later pages start landing badly enough to need corrective drags.
+How to use it:
 
-Analyze a movement snapshot run:
-
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --analyze-movement-snapshots equipment_ocr_debug/latest/movement_snapshots/<timestamp>
-```
-
-Submit one item to MIRPG Optimizer without advancing:
-
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --limit 1 --no-advance
-```
-
-During OCR/submit runs, `skip_duplicate_parsed_equipment` compares the parsed `equipment_name`, slot, and ordered on-equip effects. If overlap brings the same item back, the duplicate is logged to CSV, website submit is skipped, and the script still advances to the next item.
-
-Run multiple items:
-
-```bash
-.venv/bin/python tools/equipment_ocr_submitter.py --config tools/equipment_ocr_config.example.json --limit 10
-```
+1. Open MIRPG Optimizer to the Equipment page.
+2. Keep that Chrome tab active while the command runs.
+3. Run the command.
+4. The script selects each equipment category on the website.
+5. For each category, it clicks the first visible item in Manage Equipment, clicks Dismantle in the comparison panel, then repeats until that category is empty.
+6. The script stops if it cannot find Dismantle or if the item list does not visibly change after a dismantle click.
