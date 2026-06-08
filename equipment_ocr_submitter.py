@@ -89,9 +89,9 @@ EFFECT_LABEL_ALIASES = {
     "damage": "Damage",
     "accuracy": "Accuracy",
     "hit chance": "Accuracy",
-    "avoidance": "Avoidance",
-    "avoid chance": "Avoidance",
-    "evasion": "Avoidance",
+    "avoidance": "Evasion",
+    "avoid chance": "Evasion",
+    "evasion": "Evasion",
     "1st job skill lv": "1st Job Skill Lv.",
     "1st job skill lv.": "1st Job Skill Lv.",
     "2nd job skill lv": "2nd Job Skill Lv.",
@@ -133,13 +133,13 @@ MIRPG_KNOWN_UNSUPPORTED_EFFECTS = {
 @dataclasses.dataclass
 class EquipmentResult:
     index: int
-    image_path: Path
+    image_path: Path | None
     ocr_text_path: Path
     raw_text: str
     parsed: dict[str, Any]
     image_hash: str
     target_region: str = "equipment"
-    region_image_paths: dict[str, Path] = dataclasses.field(default_factory=dict)
+    region_image_paths: dict[str, Path | None] = dataclasses.field(default_factory=dict)
     region_ocr_text_paths: dict[str, Path] = dataclasses.field(default_factory=dict)
     full_image_path: Path | None = None
 
@@ -522,10 +522,63 @@ def parse_number(value: str, value_type: str) -> Any:
     return int(cleaned) if cleaned else None
 
 
+def infer_tier_from_text(text: str) -> int | None:
+    match = re.search(r"(?:^|[^A-Za-z0-9])(?:Tier|T)\s*[:.+-]?\s*([1-4])\b", text, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    header_lines: list[str] = []
+    for line in lines:
+        if re.search(r"\bOn[-\s]?Equip Effect\b", line, re.IGNORECASE):
+            break
+        header_lines.append(line)
+
+    for index, line in enumerate(header_lines):
+        if re.search(r"\bJob Skill Lv\.?\b", line, re.IGNORECASE):
+            continue
+        if not re.search(r"\b(?:Level|Lv\.?|Enhance)\s*\+?\d+\b", line, re.IGNORECASE):
+            continue
+        for candidate in reversed(header_lines[max(0, index - 2) : index]):
+            candidate_match = re.search(
+                r"(?:^|[^A-Za-z0-9])(?:Tier|T)\s*[:.+-]?\s*([1-4])\b",
+                candidate,
+                re.IGNORECASE,
+            )
+            if candidate_match:
+                return int(candidate_match.group(1))
+
+            compact_candidate = re.sub(r"[^A-Za-z0-9]", "", candidate).upper()
+            compact_match = re.search(r"T([1-4])", compact_candidate)
+            if compact_match:
+                return int(compact_match.group(1))
+
+            # The tier is visually right above Lv.; OCR often drops the T and reads
+            # T4/T3/T2/T1 as 14/73/12/11 on that line.
+            digits = re.findall(r"[1-4]", candidate)
+            if digits and len(candidate) <= 16:
+                return int(digits[-1])
+
+    compact = re.sub(r"[^A-Za-z0-9]", "", text).upper()
+    if len(compact) <= 16:
+        match = re.search(r"T([1-4])", compact)
+        if match:
+            return int(match.group(1))
+    if len(compact) <= 3:
+        match = re.search(r"[TI1]([1-4])", compact)
+        if match:
+            return int(match.group(1))
+        digits = re.findall(r"[1-4]", compact)
+        if len(digits) == 1:
+            return int(digits[0])
+    return None
+
+
 def normalize_effect_label(label: str) -> str:
     cleaned = label.strip()
     cleaned = re.sub(r"^[^\w]+|[^\w.]+$", "", cleaned)
     cleaned = re.sub(r"\bCRI(?:TI)*CAL\b", "Critical", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bA\s*th(?=\s+Job Skill\b)", "4th", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\bLV\b\.?", "Lv.", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" :-|")
     alias_key = cleaned.lower().rstrip(".")
@@ -553,10 +606,61 @@ def normalize_effect_value(label: str, value: str) -> tuple[Any, str]:
     return value_obj, str(value_obj)
 
 
+def repair_effect_raw_value(label: str, value_fragment: str, fallback: str) -> str:
+    if re.search(r"\bJob Skill Lv\.?$", label, re.IGNORECASE):
+        return fallback
+
+    fragment = value_fragment.strip()
+    repairs = [
+        # OCR occasionally reads the 7 in values like 2,745 as a slash: 2,/45.
+        (r"^([-+]?\d{1,3})\s*,\s*[/\\]\s*(\d{2})(?!\d)", lambda m: f"{m.group(1)},7{m.group(2)}"),
+        (r"^([-+]?\d{1,3})\s*[/\\]\s*(\d{2})(?!\d)", lambda m: f"{m.group(1)},7{m.group(2)}"),
+        # OCR sometimes drops the comma entirely: 2 745. Keep 3-digit leading
+        # values like "Defense 687 687" as comparison pairs, not 687,687.
+        (r"^([-+]?\d{1,2})\s+(\d{3})(?!\d)", lambda m: f"{m.group(1)},{m.group(2)}"),
+    ]
+    for pattern, replacement in repairs:
+        match = re.search(pattern, fragment)
+        if match:
+            return replacement(match)
+    return fallback
+
+
+def parse_ocr_letter_prefixed_effect_line(cleaned: str) -> tuple[str, str] | None:
+    # Accuracy 32 can read as "Accuracy S23" when the comparison delta is also
+    # adjacent; the generic number splitter would otherwise see label
+    # "Accuracy S2" and value "3".
+    match = re.match(r"^(?P<label>Accuracy)\s+(?P<value>[Ss][0-9])(?:[0-9])?(?:\D.*)?$", cleaned, re.IGNORECASE)
+    if not match:
+        return None
+    raw_value = re.sub(r"^[Ss]", "3", match.group("value"))
+    return match.group("label"), raw_value
+
+
 def parse_effect_line(line: str) -> dict[str, Any] | None:
     cleaned = line.strip()
     if not cleaned:
         return None
+
+    ocr_prefixed = parse_ocr_letter_prefixed_effect_line(cleaned)
+    if ocr_prefixed:
+        raw_label, raw_value = ocr_prefixed
+        label = normalize_effect_label(raw_label)
+        value, value_text = normalize_effect_value(label, raw_value)
+        if value is None:
+            return None
+        effect = {
+            "name": label,
+            "value": value,
+            "value_text": value_text,
+            "raw_line": line,
+            "raw_label": raw_label,
+            "raw_value": raw_value,
+        }
+        option_id = MIRPG_EFFECT_OPTION_IDS.get(label)
+        if option_id:
+            effect["mirpg_option_id"] = option_id
+        return effect
 
     number_re = re.compile(r"(?<![A-Za-z])[-+]?\d[\d,]*(?:\.\d+)?%?(?![A-Za-z])")
     matches = list(number_re.finditer(cleaned))
@@ -573,6 +677,7 @@ def parse_effect_line(line: str) -> dict[str, Any] | None:
         return None
 
     label = normalize_effect_label(raw_label)
+    raw_value = repair_effect_raw_value(label, cleaned[first.start() :], raw_value)
     value, value_text = normalize_effect_value(label, raw_value)
     if value is None:
         return None
@@ -621,6 +726,21 @@ def infer_equipment_slot(text: str, item_name: str | None = None) -> str | None:
         found = match.group("slot").lower()
         return next(slot for slot in EQUIPMENT_SLOTS if slot.lower() == found)
 
+    grade_words = r"Common|Rare|Epic|Unique|Legendary|Mythic|Ancient|gendary|egendary"
+    slot_aliases = {
+        "should": "Shoulder",
+        "shoulder": "Shoulder",
+        "shoulders": "Shoulder",
+    }
+    alias_pattern = "|".join(re.escape(alias) for alias in slot_aliases)
+    match = re.search(
+        rf"\b(?:{grade_words})\s+(?P<slot>{alias_pattern})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return slot_aliases[match.group("slot").lower()]
+
     name = item_name or ""
     suffix_map = {
         "Boots": "Shoes",
@@ -638,6 +758,8 @@ def infer_equipment_slot(text: str, item_name: str | None = None) -> str | None:
         "Necklace": "Necklace",
         "Earring": "Earring",
         "Earrings": "Earring",
+        "Pauldron": "Shoulder",
+        "Pauldrons": "Shoulder",
         "Shoulder": "Shoulder",
         "Shoulders": "Shoulder",
         "Eye": "Eye",
@@ -687,16 +809,15 @@ def infer_item_name(text: str, current_name: str | None = None) -> str | None:
 
 def build_equipment_name(parsed: dict[str, Any]) -> str:
     parts: list[str] = []
-    item_name = parsed.get("item_name")
-    tier = parsed.get("tier")
     grade = parsed.get("grade")
     level = parsed.get("level")
-    if tier not in {None, ""}:
-        parts.append(f"T{tier}")
-    elif item_name:
-        parts.append(str(item_name))
     if grade:
-        parts.append(str(grade))
+        grade_name = str(grade).strip()
+        grade_abbreviations = {
+            "legendary": "leg",
+            "unique": "unq",
+        }
+        parts.append(grade_abbreviations.get(grade_name.lower(), grade_name))
     if level not in {None, ""}:
         parts.append(f"Lv.{level}")
     return " - ".join(parts)
@@ -750,6 +871,10 @@ def parse_stat_rows(text: str, parser: dict[str, Any], fields: list[dict[str, An
                 continue
 
             numbers = number_re.findall(line)
+            ocr_prefixed = parse_ocr_letter_prefixed_effect_line(line)
+            if ocr_prefixed and str(stat_name) == "accuracy":
+                _ocr_label, ocr_value = ocr_prefixed
+                numbers = [ocr_value]
             if not numbers:
                 continue
 
@@ -777,6 +902,10 @@ def parse_equipment_text(text: str, config: dict[str, Any]) -> dict[str, Any]:
     for name, value in stat_values.items():
         if parsed.get(name) in {None, ""}:
             parsed[name] = value
+    if parsed.get("tier") in {None, ""}:
+        inferred_tier = infer_tier_from_text(text)
+        if inferred_tier is not None:
+            parsed["tier"] = inferred_tier
     if parser.get("keep_stat_rows", True):
         parsed["stat_rows"] = stat_values
 
@@ -794,6 +923,23 @@ def parse_equipment_text(text: str, config: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def debug_artifacts_config(config: dict[str, Any]) -> dict[str, Any]:
+    value = config.get("debug_artifacts", {})
+    return value if isinstance(value, dict) else {}
+
+
+def debug_save_full_screenshot(config: dict[str, Any]) -> bool:
+    return bool(debug_artifacts_config(config).get("save_full_screenshot", True))
+
+
+def debug_save_region_images(config: dict[str, Any]) -> bool:
+    return bool(debug_artifacts_config(config).get("save_region_images", True))
+
+
+def debug_save_legacy_primary_copy(config: dict[str, Any]) -> bool:
+    return bool(debug_artifacts_config(config).get("save_legacy_primary_copy", True))
+
+
 def save_debug_artifacts(
     *,
     debug_dir: Path,
@@ -801,13 +947,17 @@ def save_debug_artifacts(
     image: Any,
     raw_text: str,
     parsed: dict[str, Any],
-) -> tuple[Path, Path, Path]:
+    save_image: bool = True,
+) -> tuple[Path | None, Path, Path]:
     debug_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{index:04d}"
-    image_path = debug_dir / f"{prefix}_equipment.png"
+    image_path: Path | None = debug_dir / f"{prefix}_equipment.png"
     ocr_path = debug_dir / f"{prefix}_ocr.txt"
     parsed_path = debug_dir / f"{prefix}_parsed.json"
-    image.save(image_path)
+    if save_image:
+        image.save(image_path)
+    else:
+        image_path = None
     ocr_path.write_text(raw_text + "\n", encoding="utf-8")
     parsed_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return image_path, ocr_path, parsed_path
@@ -821,13 +971,17 @@ def save_region_debug_artifacts(
     image: Any,
     raw_text: str,
     parsed: dict[str, Any],
-) -> tuple[Path, Path, Path]:
+    save_image: bool = True,
+) -> tuple[Path | None, Path, Path]:
     debug_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{index:04d}_{region_name}"
-    image_path = debug_dir / f"{prefix}_equipment.png"
+    image_path: Path | None = debug_dir / f"{prefix}_equipment.png"
     ocr_path = debug_dir / f"{prefix}_ocr.txt"
     parsed_path = debug_dir / f"{prefix}_parsed.json"
-    image.save(image_path)
+    if save_image:
+        image.save(image_path)
+    else:
+        image_path = None
     ocr_path.write_text(raw_text + "\n", encoding="utf-8")
     parsed_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return image_path, ocr_path, parsed_path
@@ -975,16 +1129,40 @@ def prepare_chrome_applescript(config: dict[str, Any]) -> None:
         )
 
 
-def mirpg_applescript_payload(parsed: dict[str, Any]) -> dict[str, Any]:
-    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed)
+def require_mirpg_equipment_slot(parsed: dict[str, Any], website: dict[str, Any]) -> str | None:
+    if not bool(website.get("require_equipment_slot_for_submit", True)):
+        slot = parsed.get("equipment_slot")
+        return str(slot) if slot else None
+
+    slot = parsed.get("equipment_slot")
+    if slot:
+        return str(slot)
+
+    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed) or "(unknown item)"
+    raw_lines = parsed.get("lines")
+    if not isinstance(raw_lines, list):
+        raw_text = str(parsed.get("raw_text", ""))
+        raw_lines = raw_text.splitlines()
+    header = " | ".join(str(line).strip() for line in raw_lines[:6] if str(line).strip())
+    raise AutomationError(
+        "Could not infer MIRPG equipment slot for "
+        f"{equipment_name}; refusing to submit so it does not overwrite the currently selected website category. "
+        f"OCR header: {header or '(empty)'}"
+    )
+
+
+def mirpg_applescript_payload(parsed: dict[str, Any], website: dict[str, Any] | None = None) -> dict[str, Any]:
+    website = website or {}
     effects = [dict(effect) for effect in parsed.get("on_equip_effects", [])]
+    equipment_name = build_equipment_name(parsed) or parsed.get("equipment_name")
     if not equipment_name:
         raise AutomationError("Parsed item does not have an equipment_name.")
     if not effects:
         raise AutomationError(f"No On-Equip Effect rows parsed for {equipment_name}.")
+    slot = require_mirpg_equipment_slot(parsed, website)
     return {
         "equipment_name": str(equipment_name),
-        "equipment_slot": parsed.get("equipment_slot"),
+        "equipment_slot": slot,
         "on_equip_effects": effects,
     }
 
@@ -1021,6 +1199,11 @@ def mirpg_applescript_js(payload: dict[str, Any], website: dict[str, Any]) -> st
     .replace(/\\s+/g, " ")
     .trim();
   const labelKey = (value) => String(value || "").replace(/\\s+/g, " ").trim().replace(/\\.$/, "").toLowerCase();
+  const labelAliases = {{
+    "avoidance": "evasion",
+    "avoid chance": "evasion"
+  }};
+  const canonicalLabelKey = (value) => labelAliases[labelKey(value)] || labelKey(value);
   const numberOnly = (value) => String(value ?? "").replace(/,/g, "").replace(/%$/, "");
   const slotIdFromName = (slot) => String(slot || "")
     .trim()
@@ -1137,8 +1320,8 @@ def mirpg_applescript_js(payload: dict[str, Any], website: dict[str, Any]) -> st
   }};
 
   const popFirstEffect = (effects, label) => {{
-    const wanted = labelKey(label);
-    const index = effects.findIndex((effect) => labelKey(effect.name) === wanted);
+    const wanted = canonicalLabelKey(label);
+    const index = effects.findIndex((effect) => canonicalLabelKey(effect.name) === wanted);
     if (index < 0) return null;
     return effects.splice(index, 1)[0];
   }};
@@ -1204,10 +1387,10 @@ def mirpg_applescript_js(payload: dict[str, Any], website: dict[str, Any]) -> st
   }};
 
   const selectSubOption = (select, effect) => {{
-    const wantedLabel = labelKey(effect.name);
+    const wantedLabel = canonicalLabelKey(effect.name);
     const wantedId = String(effect.mirpg_option_id || "");
     const options = Array.from(select.options || []);
-    const option = options.find((item) => labelKey(item.textContent) === wantedLabel)
+    const option = options.find((item) => canonicalLabelKey(item.textContent) === wantedLabel)
       || options.find((item) => wantedId && item.value === wantedId);
     if (!option) {{
       const available = options.map((item) => item.textContent.trim()).filter(Boolean).join(", ");
@@ -1278,9 +1461,9 @@ def mirpg_applescript_js(payload: dict[str, Any], website: dict[str, Any]) -> st
     const input = entry.row ? Array.from(entry.row.querySelectorAll("input[type='number']")).find(visible) : null;
     return `row ${{index + 1}} value=${{entry.select.value || "(empty)"}} label=${{label}} input=${{input ? "yes" : "no"}}`;
   }}).join(" | ");
-  const knownUnsupportedEffectKeys = new Set((settings.known_unsupported_effects || []).map(labelKey));
+  const knownUnsupportedEffectKeys = new Set((settings.known_unsupported_effects || []).map(canonicalLabelKey));
   const shouldSkipEffect = (effect) => settings.skip_known_unsupported_effects
-    && knownUnsupportedEffectKeys.has(labelKey(effect.name));
+    && knownUnsupportedEffectKeys.has(canonicalLabelKey(effect.name));
 
   (async () => {{
     try {{
@@ -1414,7 +1597,7 @@ def mirpg_applescript_js(payload: dict[str, Any], website: dict[str, Any]) -> st
 
 def submit_to_mirpg_optimizer_applescript(parsed: dict[str, Any], config: dict[str, Any]) -> None:
     website = config.get("website", {})
-    payload = mirpg_applescript_payload(parsed)
+    payload = mirpg_applescript_payload(parsed, website)
     run_chrome_javascript(mirpg_applescript_js(payload, website), timeout=float(website.get("applescript_timeout_seconds", 20)))
 
     timeout_seconds = float(website.get("applescript_timeout_seconds", 20))
@@ -1444,6 +1627,645 @@ def submit_to_mirpg_optimizer_applescript(parsed: dict[str, Any], config: dict[s
         time.sleep(poll_interval)
 
     raise AutomationError(f"Timed out waiting for Chrome AppleScript automation. Last state: {last_state}")
+
+
+def mirpg_unequip_slots(website: dict[str, Any]) -> list[str]:
+    slots = website.get("unequip_slots", EQUIPMENT_SLOTS)
+    if not isinstance(slots, list):
+        raise AutomationError("website.unequip_slots must be a list.")
+    cleaned = [str(slot).strip() for slot in slots if str(slot).strip()]
+    if not cleaned:
+        raise AutomationError("website.unequip_slots must include at least one slot.")
+    return cleaned
+
+
+def mirpg_unequip_all_js(website: dict[str, Any]) -> str:
+    settings = {
+        "slots": mirpg_unequip_slots(website),
+        "top_level_slot_max_y": website.get("top_level_slot_max_y"),
+        "wait_after_slot_change_ms": int(float(website.get("wait_after_slot_change_seconds", 0.35)) * 1000),
+        "wait_after_unequip_ms": int(float(website.get("wait_after_unequip_seconds", 0.45)) * 1000),
+        "require_unequip_button": bool(website.get("require_unequip_button", False)),
+    }
+    return f"""
+(() => {{
+  const settings = {json.dumps(settings)};
+  const resultKey = "__mirpgOptimizerUnequipResult";
+  window[resultKey] = {{ done: false, error: null }};
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (el) => {{
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const box = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && box.width > 0 && box.height > 0;
+  }};
+  const textOf = (el) => (el.innerText || el.textContent || "").trim();
+  const elementText = (el) => [textOf(el), el.getAttribute("aria-label"), el.getAttribute("title")]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\\s+/g, " ")
+    .trim();
+  const labelKey = (value) => String(value || "").replace(/\\s+/g, " ").trim().replace(/\\.$/, "").toLowerCase();
+  const slotIdFromName = (slot) => String(slot || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\\s+/g, "-");
+  const slotTextMatcher = (slot) => {{
+    const wanted = labelKey(slot);
+    return (text) => {{
+      const key = labelKey(text);
+      return key === wanted || key === `${{wanted}} ${{wanted}}` || key.split(/\\s+/).includes(wanted);
+    }};
+  }};
+  const visibleElements = (selector, scope = document) => Array.from(scope.querySelectorAll(selector)).filter(visible);
+  const areaOf = (el) => {{
+    const box = el.getBoundingClientRect();
+    return box.width * box.height;
+  }};
+  const firstByPosition = (items) => items.sort((a, b) => {{
+    const ab = a.getBoundingClientRect();
+    const bb = b.getBoundingClientRect();
+    return ab.top - bb.top || ab.left - bb.left;
+  }})[0];
+  const clickElement = (el) => {{
+    el.scrollIntoView({{ block: "center", inline: "center" }});
+    el.click();
+  }};
+  const visibleButtonSummary = (scope = document) => Array.from(scope.querySelectorAll("button, [role='button']"))
+    .filter(visible)
+    .sort((a, b) => {{
+      const ab = a.getBoundingClientRect();
+      const bb = b.getBoundingClientRect();
+      return ab.top - bb.top || ab.left - bb.left;
+    }})
+    .map((el) => {{
+      const box = el.getBoundingClientRect();
+      return `${{elementText(el) || el.tagName}} @${{Math.round(box.left)}},${{Math.round(box.top)}}`;
+    }})
+    .slice(0, 80)
+    .join(" | ");
+  const findComparePanel = () => {{
+    const candidates = visibleElements("div, section, article").filter((el) => {{
+      const text = textOf(el);
+      return text.includes("Compare Equipment") && text.includes("MAIN OPTION");
+    }});
+    return candidates.sort((a, b) => areaOf(a) - areaOf(b))[0] || null;
+  }};
+  const findLeftUnequipButton = () => {{
+    const panel = findComparePanel();
+    if (!panel) {{
+      throw new Error(`Could not find Compare Equipment panel. Visible buttons: ${{visibleButtonSummary(document)}}`);
+    }}
+    const cardCandidates = visibleElements("div, section, article, form", panel).filter((el) => {{
+      const text = textOf(el);
+      return text.includes("MAIN OPTION")
+        && /\\bUnequip\\b/i.test(text)
+        && visibleElements("button, [role='button'], a, [onclick]", el).some((button) => /\\bUnequip\\b/i.test(elementText(button)));
+    }});
+    const cards = cardCandidates.sort((a, b) => {{
+      const ab = a.getBoundingClientRect();
+      const bb = b.getBoundingClientRect();
+      return areaOf(a) - areaOf(b) || ab.left - bb.left || ab.top - bb.top;
+    }});
+    const card = cards[0] || panel;
+    const buttons = visibleElements("button, [role='button'], a, [onclick]", card)
+      .filter((button) => /\\bUnequip\\b/i.test(elementText(button)))
+      .sort((a, b) => {{
+        const ab = a.getBoundingClientRect();
+        const bb = b.getBoundingClientRect();
+        return ab.left - bb.left || ab.top - bb.top;
+      }});
+    return buttons[0] || null;
+  }};
+  const selectSlot = async (slot) => {{
+    const slotId = slotIdFromName(slot);
+    if (slotId && typeof window.selectComparisonSlot === "function") {{
+      window.selectComparisonSlot(slotId);
+      await sleep(settings.wait_after_slot_change_ms);
+      return;
+    }}
+
+    let slotButtons = visibleElements("button, [role='button']").filter((button) => slotTextMatcher(slot)(elementText(button)));
+    if (settings.top_level_slot_max_y !== null && settings.top_level_slot_max_y !== undefined) {{
+      slotButtons = slotButtons.filter((button) => button.getBoundingClientRect().top <= Number(settings.top_level_slot_max_y));
+    }}
+    if (!slotButtons.length) {{
+      throw new Error(`Could not find top-level equipment slot button: ${{slot}}. Visible buttons: ${{visibleButtonSummary(document)}}`);
+    }}
+    clickElement(firstByPosition(slotButtons));
+    await sleep(settings.wait_after_slot_change_ms);
+  }};
+
+  (async () => {{
+    const results = [];
+    try {{
+      for (const slot of settings.slots) {{
+        await selectSlot(slot);
+        const button = findLeftUnequipButton();
+        if (!button) {{
+          if (settings.require_unequip_button) {{
+            throw new Error(`Could not find left/equipped Unequip button for slot: ${{slot}}`);
+          }}
+          results.push({{ slot, status: "not_equipped" }});
+          continue;
+        }}
+
+        const box = button.getBoundingClientRect();
+        clickElement(button);
+        await sleep(settings.wait_after_unequip_ms);
+        results.push({{
+          slot,
+          status: "unequipped",
+          button_center: [Math.round(box.left + box.width / 2), Math.round(box.top + box.height / 2)]
+        }});
+      }}
+
+      window[resultKey] = {{ done: true, error: null, result: {{ slots: results }} }};
+    }} catch (error) {{
+      window[resultKey] = {{ done: true, error: String(error && error.message ? error.message : error), result: {{ slots: results }} }};
+    }}
+  }})();
+
+  return "started";
+}})();
+"""
+
+
+def poll_mirpg_unequip_applescript(config: dict[str, Any]) -> dict[str, Any]:
+    website = config.get("website", {})
+    timeout_seconds = float(website.get("unequip_timeout_seconds", website.get("applescript_timeout_seconds", 20)))
+    poll_interval = float(website.get("applescript_poll_interval_seconds", 0.25))
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        raw_state = run_chrome_javascript(
+            "JSON.stringify(window.__mirpgOptimizerUnequipResult || {})",
+            timeout=min(5.0, timeout_seconds),
+        )
+        try:
+            last_state = json.loads(raw_state) if raw_state else {}
+        except json.JSONDecodeError:
+            last_state = {"raw_state": raw_state}
+
+        if last_state.get("done"):
+            if last_state.get("error"):
+                raise AutomationError(str(last_state["error"]))
+            result = last_state.get("result")
+            return result if isinstance(result, dict) else {}
+        time.sleep(poll_interval)
+
+    raise AutomationError(f"Timed out waiting for Chrome AppleScript unequip automation. Last state: {last_state}")
+
+
+def poll_mirpg_unequip_playwright(page: Any, config: dict[str, Any]) -> dict[str, Any]:
+    website = config.get("website", {})
+    timeout_seconds = float(website.get("unequip_timeout_seconds", website.get("applescript_timeout_seconds", 20)))
+    poll_interval = float(website.get("applescript_poll_interval_seconds", 0.25))
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        raw_state = page.evaluate("JSON.stringify(window.__mirpgOptimizerUnequipResult || {})")
+        try:
+            last_state = json.loads(raw_state) if raw_state else {}
+        except json.JSONDecodeError:
+            last_state = {"raw_state": raw_state}
+
+        if last_state.get("done"):
+            if last_state.get("error"):
+                raise AutomationError(str(last_state["error"]))
+            result = last_state.get("result")
+            return result if isinstance(result, dict) else {}
+        time.sleep(poll_interval)
+
+    raise AutomationError(f"Timed out waiting for Playwright unequip automation. Last state: {last_state}")
+
+
+def print_mirpg_unequip_summary(result: dict[str, Any]) -> None:
+    slots = result.get("slots") if isinstance(result.get("slots"), list) else []
+    unequipped = [slot for slot in slots if isinstance(slot, dict) and slot.get("status") == "unequipped"]
+    skipped = [slot for slot in slots if isinstance(slot, dict) and slot.get("status") != "unequipped"]
+    for entry in slots:
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status", "unknown")
+        slot = entry.get("slot", "(unknown)")
+        center = entry.get("button_center")
+        suffix = f" at {center}" if center else ""
+        print(f"{slot}: {status}{suffix}")
+    print(f"Website unequip summary: unequipped={len(unequipped)}, skipped={len(skipped)}")
+
+
+def run_mirpg_unequip_all_website(config: dict[str, Any], driver: str, page: Any = None) -> None:
+    website = config.get("website", {})
+    if website.get("automation_mode") != "mirpg_optimizer":
+        raise AutomationError("--unequip-website requires website.automation_mode = mirpg_optimizer.")
+    js_code = mirpg_unequip_all_js(website)
+    if driver == "chrome_applescript":
+        run_chrome_javascript(js_code, timeout=float(website.get("applescript_timeout_seconds", 20)))
+        result = poll_mirpg_unequip_applescript(config)
+    elif driver == "playwright":
+        if page is None:
+            raise AutomationError("Playwright unequip automation requires an active page.")
+        page.evaluate(js_code)
+        result = poll_mirpg_unequip_playwright(page, config)
+    else:
+        raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+    print_mirpg_unequip_summary(result)
+
+
+def mirpg_dismantle_slots(website: dict[str, Any]) -> list[str]:
+    slots = website.get("dismantle_slots", website.get("unequip_slots", EQUIPMENT_SLOTS))
+    if not isinstance(slots, list):
+        raise AutomationError("website.dismantle_slots must be a list.")
+    cleaned = [str(slot).strip() for slot in slots if str(slot).strip()]
+    if not cleaned:
+        raise AutomationError("website.dismantle_slots must include at least one slot.")
+    return cleaned
+
+
+def mirpg_dismantle_all_js(website: dict[str, Any]) -> str:
+    settings = {
+        "slots": mirpg_dismantle_slots(website),
+        "top_level_slot_max_y": website.get("top_level_slot_max_y"),
+        "wait_after_slot_change_ms": int(float(website.get("wait_after_slot_change_seconds", 0.35)) * 1000),
+        "wait_after_manage_filter_ms": int(float(website.get("wait_after_manage_filter_seconds", 0.25)) * 1000),
+        "wait_after_manage_item_click_ms": int(float(website.get("wait_after_manage_item_click_seconds", 0.25)) * 1000),
+        "wait_after_dismantle_ms": int(float(website.get("wait_after_dismantle_seconds", 0.45)) * 1000),
+        "max_dismantle_per_slot": int(website.get("max_dismantle_per_slot", 300)),
+        "require_dismantle_button": bool(website.get("require_dismantle_button", True)),
+        "require_dismantle_progress": bool(website.get("require_dismantle_progress", True)),
+        "click_manage_slot_filter": bool(website.get("click_manage_slot_filter", True)),
+        "auto_confirm_dismantle": bool(website.get("auto_confirm_dismantle", True)),
+    }
+    template = r"""
+(() => {
+  const settings = __SETTINGS__;
+  const resultKey = "__mirpgOptimizerDismantleResult";
+  window[resultKey] = { done: false, error: null };
+
+  const originalConfirm = window.confirm;
+  if (settings.auto_confirm_dismantle) {
+    window.confirm = () => true;
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const box = el.getBoundingClientRect();
+    return style.visibility !== "hidden" && style.display !== "none" && box.width > 0 && box.height > 0;
+  };
+  const textOf = (el) => (el.innerText || el.textContent || "").trim();
+  const elementText = (el) => [textOf(el), el.getAttribute("aria-label"), el.getAttribute("title")]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const labelKey = (value) => String(value || "").replace(/\s+/g, " ").trim().replace(/\.$/, "").toLowerCase();
+  const slotIdFromName = (slot) => String(slot || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
+  const slotTextMatcher = (slot) => {
+    const wanted = labelKey(slot);
+    return (text) => {
+      const key = labelKey(text);
+      return key === wanted || key === `${wanted} ${wanted}` || key.split(/\s+/).includes(wanted);
+    };
+  };
+  const visibleElements = (selector, scope = document) => Array.from(scope.querySelectorAll(selector)).filter(visible);
+  const areaOf = (el) => {
+    const box = el.getBoundingClientRect();
+    return box.width * box.height;
+  };
+  const firstByPosition = (items) => items.sort((a, b) => {
+    const ab = a.getBoundingClientRect();
+    const bb = b.getBoundingClientRect();
+    return ab.top - bb.top || ab.left - bb.left;
+  })[0];
+  const clickElement = (el) => {
+    el.scrollIntoView({ block: "center", inline: "center" });
+    el.click();
+  };
+  const clickableTarget = (el) => {
+    const target = el.closest("button, [role='button'], a, [onclick]");
+    return target && visible(target) ? target : el;
+  };
+  const visibleButtonSummary = (scope = document) => Array.from(scope.querySelectorAll("button, [role='button'], a, [onclick]"))
+    .filter(visible)
+    .sort((a, b) => {
+      const ab = a.getBoundingClientRect();
+      const bb = b.getBoundingClientRect();
+      return ab.top - bb.top || ab.left - bb.left;
+    })
+    .map((el) => {
+      const box = el.getBoundingClientRect();
+      return `${elementText(el) || el.tagName} @${Math.round(box.left)},${Math.round(box.top)}`;
+    })
+    .slice(0, 100)
+    .join(" | ");
+  const findSmallestPanel = (heading, extraMatcher = () => true) => {
+    const candidates = visibleElements("div, section, article, main").filter((el) => {
+      const text = textOf(el);
+      return text.includes(heading) && extraMatcher(text, el);
+    });
+    return candidates.sort((a, b) => areaOf(a) - areaOf(b))[0] || null;
+  };
+  const findManagePanel = () => {
+    const panel = findSmallestPanel("Manage Equipment", (text) => {
+      const key = labelKey(text);
+      return key.includes("add equipment") && /\ball\b/i.test(text) && settings.slots.some((slot) => key.includes(labelKey(slot)));
+    });
+    if (!panel) {
+      throw new Error(`Could not find Manage Equipment panel. Visible buttons: ${visibleButtonSummary(document)}`);
+    }
+    return panel;
+  };
+  const findComparePanel = () => {
+    const panel = findSmallestPanel("Compare Equipment", (text) => text.includes("MAIN OPTION"));
+    if (!panel) {
+      throw new Error(`Could not find Compare Equipment panel. Visible buttons: ${visibleButtonSummary(document)}`);
+    }
+    return panel;
+  };
+  const selectSlot = async (slot) => {
+    const slotId = slotIdFromName(slot);
+    if (slotId && typeof window.selectComparisonSlot === "function") {
+      window.selectComparisonSlot(slotId);
+      await sleep(settings.wait_after_slot_change_ms);
+      return;
+    }
+
+    let slotButtons = visibleElements("button, [role='button']").filter((button) => slotTextMatcher(slot)(elementText(button)));
+    if (settings.top_level_slot_max_y !== null && settings.top_level_slot_max_y !== undefined) {
+      slotButtons = slotButtons.filter((button) => button.getBoundingClientRect().top <= Number(settings.top_level_slot_max_y));
+    }
+    if (!slotButtons.length) {
+      throw new Error(`Could not find top-level equipment slot button: ${slot}. Visible buttons: ${visibleButtonSummary(document)}`);
+    }
+    clickElement(firstByPosition(slotButtons));
+    await sleep(settings.wait_after_slot_change_ms);
+  };
+  const clickManageSlotFilter = async (slot) => {
+    if (!settings.click_manage_slot_filter) return;
+    const panel = findManagePanel();
+    const wanted = labelKey(slot);
+    const buttons = visibleElements("button, [role='button']", panel)
+      .filter((button) => {
+        const key = labelKey(elementText(button));
+        return key === wanted || key === `${wanted} ${wanted}`;
+      });
+    if (buttons.length) {
+      clickElement(firstByPosition(buttons));
+      await sleep(settings.wait_after_manage_filter_ms);
+    }
+  };
+  const manageCardFingerprint = (el) => {
+    const box = el.getBoundingClientRect();
+    return {
+      text: elementText(el),
+      center: [Math.round(box.left + box.width / 2), Math.round(box.top + box.height / 2)],
+      size: [Math.round(box.width), Math.round(box.height)]
+    };
+  };
+  const sameFingerprint = (a, b) => {
+    if (!a || !b) return false;
+    return a.text === b.text
+      && Math.abs(a.center[0] - b.center[0]) <= 2
+      && Math.abs(a.center[1] - b.center[1]) <= 2;
+  };
+  const findManageItemCards = (slot) => {
+    const panel = findManagePanel();
+    const panelBox = panel.getBoundingClientRect();
+    const wanted = labelKey(slot);
+    const filterKeys = new Set(["all", "all all", ...settings.slots.map(labelKey), ...settings.slots.map((item) => `${labelKey(item)} ${labelKey(item)}`)]);
+    const raw = visibleElements("button, [role='button'], a, [onclick], div, section, article", panel)
+      .filter((el) => {
+        const text = elementText(el);
+        const key = labelKey(text);
+        if (!key || filterKeys.has(key)) return false;
+        if (/add equipment/i.test(text)) return false;
+        if (!key.includes(wanted)) return false;
+        const box = el.getBoundingClientRect();
+        if (box.top < panelBox.top + 70) return false;
+        if (box.width < 55 || box.height < 35 || box.width > 260 || box.height > 170) return false;
+        return true;
+      })
+      .map(clickableTarget)
+      .filter((el) => panel.contains(el) && visible(el));
+
+    const unique = [];
+    const seen = new Set();
+    for (const el of raw.sort((a, b) => areaOf(a) - areaOf(b))) {
+      const box = el.getBoundingClientRect();
+      const key = `${Math.round(box.left / 4)}:${Math.round(box.top / 4)}:${Math.round(box.width / 4)}:${Math.round(box.height / 4)}:${elementText(el)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(el);
+    }
+    return unique.sort((a, b) => {
+      const ab = a.getBoundingClientRect();
+      const bb = b.getBoundingClientRect();
+      return ab.top - bb.top || ab.left - bb.left || areaOf(a) - areaOf(b);
+    });
+  };
+  const findDismantleButton = () => {
+    const panel = findComparePanel();
+    const cardCandidates = visibleElements("div, section, article, form", panel)
+      .filter((el) => {
+        const text = textOf(el);
+        return text.includes("MAIN OPTION")
+          && /\bDismantle\b/i.test(text)
+          && visibleElements("button, [role='button'], a, [onclick]", el).some((button) => /\bDismantle\b/i.test(elementText(button)));
+      })
+      .sort((a, b) => {
+        const ab = a.getBoundingClientRect();
+        const bb = b.getBoundingClientRect();
+        return areaOf(a) - areaOf(b) || bb.left - ab.left || ab.top - bb.top;
+      });
+    const scope = cardCandidates[0] || panel;
+    const buttons = visibleElements("button, [role='button'], a, [onclick]", scope)
+      .filter((button) => /\bDismantle\b/i.test(elementText(button)))
+      .sort((a, b) => {
+        const ab = a.getBoundingClientRect();
+        const bb = b.getBoundingClientRect();
+        return bb.left - ab.left || ab.top - bb.top;
+      });
+    return buttons[0] || null;
+  };
+  const clickDialogConfirmationIfPresent = async () => {
+    await sleep(120);
+    const dialogs = visibleElements("[role='dialog'], dialog, [aria-modal='true'], .modal, [class*='modal'], [class*='Modal']");
+    if (!dialogs.length) return false;
+    const dialog = dialogs.sort((a, b) => areaOf(a) - areaOf(b))[0];
+    const buttons = visibleElements("button, [role='button'], a, [onclick]", dialog)
+      .filter((button) => /confirm|ok|yes|dismantle/i.test(elementText(button)) && !/cancel|no/i.test(elementText(button)))
+      .sort((a, b) => areaOf(a) - areaOf(b));
+    if (!buttons.length) return false;
+    clickElement(buttons[0]);
+    return true;
+  };
+
+  (async () => {
+    const slotResults = [];
+    const itemResults = [];
+    try {
+      for (const slot of settings.slots) {
+        await selectSlot(slot);
+        await clickManageSlotFilter(slot);
+        let dismantled = 0;
+        let skipped = 0;
+
+        for (let attempt = 0; attempt < settings.max_dismantle_per_slot; attempt += 1) {
+          const beforeCards = findManageItemCards(slot);
+          if (!beforeCards.length) break;
+
+          const beforeCount = beforeCards.length;
+          const card = beforeCards[0];
+          const beforeFingerprint = manageCardFingerprint(card);
+          clickElement(card);
+          await sleep(settings.wait_after_manage_item_click_ms);
+
+          const button = findDismantleButton();
+          if (!button) {
+            if (settings.require_dismantle_button) {
+              throw new Error(`Could not find Dismantle button after selecting ${slot} item ${JSON.stringify(beforeFingerprint)}. Compare buttons: ${visibleButtonSummary(findComparePanel())}`);
+            }
+            skipped += 1;
+            itemResults.push({ slot, status: "missing_dismantle", item: beforeFingerprint });
+            break;
+          }
+
+          const buttonBox = button.getBoundingClientRect();
+          clickElement(button);
+          await clickDialogConfirmationIfPresent();
+          await sleep(settings.wait_after_dismantle_ms);
+          await clickManageSlotFilter(slot);
+
+          const afterCards = findManageItemCards(slot);
+          const afterFingerprint = afterCards.length ? manageCardFingerprint(afterCards[0]) : null;
+          if (settings.require_dismantle_progress && afterCards.length >= beforeCount && sameFingerprint(beforeFingerprint, afterFingerprint)) {
+            throw new Error(
+              `Dismantle did not appear to remove the first ${slot} item. `
+              + `Before count=${beforeCount}, after count=${afterCards.length}, item=${JSON.stringify(beforeFingerprint)}`
+            );
+          }
+
+          dismantled += 1;
+          itemResults.push({
+            slot,
+            status: "dismantled",
+            item: beforeFingerprint,
+            button_center: [Math.round(buttonBox.left + buttonBox.width / 2), Math.round(buttonBox.top + buttonBox.height / 2)]
+          });
+        }
+
+        slotResults.push({ slot, dismantled, skipped });
+      }
+
+      if (settings.auto_confirm_dismantle) {
+        window.confirm = originalConfirm;
+      }
+      window[resultKey] = { done: true, error: null, result: { slots: slotResults, items: itemResults } };
+    } catch (error) {
+      if (settings.auto_confirm_dismantle) {
+        window.confirm = originalConfirm;
+      }
+      window[resultKey] = {
+        done: true,
+        error: String(error && error.message ? error.message : error),
+        result: { slots: slotResults, items: itemResults }
+      };
+    }
+  })();
+
+  return "started";
+})();
+"""
+    return template.replace("__SETTINGS__", json.dumps(settings))
+
+
+def poll_mirpg_dismantle_applescript(config: dict[str, Any]) -> dict[str, Any]:
+    website = config.get("website", {})
+    timeout_seconds = float(website.get("dismantle_timeout_seconds", website.get("applescript_timeout_seconds", 20)))
+    poll_interval = float(website.get("applescript_poll_interval_seconds", 0.25))
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        raw_state = run_chrome_javascript(
+            "JSON.stringify(window.__mirpgOptimizerDismantleResult || {})",
+            timeout=min(5.0, timeout_seconds),
+        )
+        try:
+            last_state = json.loads(raw_state) if raw_state else {}
+        except json.JSONDecodeError:
+            last_state = {"raw_state": raw_state}
+
+        if last_state.get("done"):
+            if last_state.get("error"):
+                raise AutomationError(str(last_state["error"]))
+            result = last_state.get("result")
+            return result if isinstance(result, dict) else {}
+        time.sleep(poll_interval)
+
+    raise AutomationError(f"Timed out waiting for Chrome AppleScript dismantle automation. Last state: {last_state}")
+
+
+def poll_mirpg_dismantle_playwright(page: Any, config: dict[str, Any]) -> dict[str, Any]:
+    website = config.get("website", {})
+    timeout_seconds = float(website.get("dismantle_timeout_seconds", website.get("applescript_timeout_seconds", 20)))
+    poll_interval = float(website.get("applescript_poll_interval_seconds", 0.25))
+    deadline = time.monotonic() + timeout_seconds
+    last_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        raw_state = page.evaluate("JSON.stringify(window.__mirpgOptimizerDismantleResult || {})")
+        try:
+            last_state = json.loads(raw_state) if raw_state else {}
+        except json.JSONDecodeError:
+            last_state = {"raw_state": raw_state}
+
+        if last_state.get("done"):
+            if last_state.get("error"):
+                raise AutomationError(str(last_state["error"]))
+            result = last_state.get("result")
+            return result if isinstance(result, dict) else {}
+        time.sleep(poll_interval)
+
+    raise AutomationError(f"Timed out waiting for Playwright dismantle automation. Last state: {last_state}")
+
+
+def print_mirpg_dismantle_summary(result: dict[str, Any]) -> None:
+    slots = result.get("slots") if isinstance(result.get("slots"), list) else []
+    items = result.get("items") if isinstance(result.get("items"), list) else []
+    for entry in slots:
+        if not isinstance(entry, dict):
+            continue
+        print(
+            f"{entry.get('slot', '(unknown)')}: "
+            f"dismantled={entry.get('dismantled', 0)}, skipped={entry.get('skipped', 0)}"
+        )
+    dismantled = [item for item in items if isinstance(item, dict) and item.get("status") == "dismantled"]
+    skipped = [item for item in items if isinstance(item, dict) and item.get("status") != "dismantled"]
+    print(f"Website dismantle summary: dismantled={len(dismantled)}, skipped={len(skipped)}")
+
+
+def run_mirpg_dismantle_all_website(config: dict[str, Any], driver: str, page: Any = None) -> None:
+    website = config.get("website", {})
+    if website.get("automation_mode") != "mirpg_optimizer":
+        raise AutomationError("--dismantle-website requires website.automation_mode = mirpg_optimizer.")
+    js_code = mirpg_dismantle_all_js(website)
+    if driver == "chrome_applescript":
+        run_chrome_javascript(js_code, timeout=float(website.get("applescript_timeout_seconds", 20)))
+        result = poll_mirpg_dismantle_applescript(config)
+    elif driver == "playwright":
+        if page is None:
+            raise AutomationError("Playwright dismantle automation requires an active page.")
+        page.evaluate(js_code)
+        result = poll_mirpg_dismantle_playwright(page, config)
+    else:
+        raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+    print_mirpg_dismantle_summary(result)
 
 
 def submit_to_website_applescript(parsed: dict[str, Any], config: dict[str, Any]) -> None:
@@ -1712,14 +2534,14 @@ def fill_mirpg_sub_options(editor: Any, effects: list[dict[str, Any]], website: 
 
 def submit_to_mirpg_optimizer(page: Any, parsed: dict[str, Any], config: dict[str, Any]) -> None:
     website = config.get("website", {})
-    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed)
     effects = [dict(effect) for effect in parsed.get("on_equip_effects", [])]
+    equipment_name = build_equipment_name(parsed) or parsed.get("equipment_name")
     if not equipment_name:
         raise AutomationError("Parsed item does not have an equipment_name.")
     if not effects:
         raise AutomationError(f"No On-Equip Effect rows parsed for {equipment_name}.")
 
-    slot = parsed.get("equipment_slot")
+    slot = require_mirpg_equipment_slot(parsed, website)
     if slot and website.get("select_slot_tab", True):
         select_mirpg_top_level_slot(page, str(slot), website)
 
@@ -2278,6 +3100,8 @@ def run_advance_action(
         if snapshotter is not None and snapshotter.capture_wait_actions():
             snapshotter.capture("after_wait", action, label)
     elif action_type == "adb_tap":
+        if snapshotter is not None and snapshotter.capture_before_click():
+            snapshotter.capture("before_adb_tap", action, label)
         run_adb_input(config, ["tap", str(int(action["x"])), str(int(action["y"]))])
         if snapshotter is not None:
             snapshotter.capture("after_adb_tap", action, label)
@@ -2486,6 +3310,152 @@ def detected_page_scroll_actions(config: dict[str, Any], mode: str = "page") -> 
     return [action_for_input_backend(action, backend) for action in scroll_actions]
 
 
+def equipped_slot_positions(config: dict[str, Any]) -> list[dict[str, Any]]:
+    positions = config.get("advance", {}).get("equipped_slot_positions", [])
+    if not isinstance(positions, list):
+        raise AutomationError("advance.equipped_slot_positions must be a list.")
+
+    parsed: list[dict[str, Any]] = []
+    for index, position in enumerate(positions, start=1):
+        if isinstance(position, dict):
+            if position.get("skip"):
+                continue
+            if "x" not in position or "y" not in position:
+                raise AutomationError("Every advance.equipped_slot_positions object must include x and y.")
+            label = str(position.get("label") or f"slot_{index:02d}")
+            parsed.append({"label": label, "x": float(position["x"]), "y": float(position["y"])})
+        elif isinstance(position, list) and len(position) in {2, 3}:
+            label = str(position[2]) if len(position) == 3 else f"slot_{index:02d}"
+            parsed.append({"label": label, "x": float(position[0]), "y": float(position[1])})
+        else:
+            raise AutomationError("advance.equipped_slot_positions entries must be objects or [x, y, label?].")
+    return parsed
+
+
+def equipped_slot_action(config: dict[str, Any], slot: dict[str, Any]) -> dict[str, Any]:
+    action_type = "adb_tap" if advance_input_backend(config) == "adb" else "click"
+    return {"type": action_type, "x": int(round(float(slot["x"]))), "y": int(round(float(slot["y"])))}
+
+
+def equipped_slot_detection_config(config: dict[str, Any]) -> dict[str, Any]:
+    advance = config.get("advance", {})
+    detect_config = dict(detected_items_config(config))
+    custom = advance.get("equipped_slot_detection", {})
+    if isinstance(custom, dict):
+        detect_config.update(custom)
+    detect_config.setdefault("region", [40, 40, 920, 1240])
+    detect_config.setdefault("max_items_per_page", len(advance.get("equipped_slot_positions", [])) or 12)
+    return detect_config
+
+
+def detect_equipped_slot_boxes(image: Any, config: dict[str, Any]) -> list[dict[str, Any]]:
+    temp_config = dict(config)
+    temp_advance = dict(config.get("advance", {}))
+    temp_advance["detect_items"] = equipped_slot_detection_config(config)
+    temp_config["advance"] = temp_advance
+    return detect_visible_item_boxes(image, temp_config)
+
+
+def detect_nearest_equipped_slot_box(
+    image: Any,
+    slot: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, int]:
+    boxes = detect_equipped_slot_boxes(image, config)
+    if not boxes:
+        return None, 0
+    signed_boxes, _row_centers = prepare_manual_detected_viewport(boxes, config)
+    slot_x = float(slot["x"])
+    slot_y = float(slot["y"])
+    return min(
+        signed_boxes,
+        key=lambda box: (
+            (float(box["center"][0]) - slot_x) ** 2 + (float(box["center"][1]) - slot_y) ** 2,
+            float(box["center"][1]),
+            float(box["center"][0]),
+        ),
+    ), len(boxes)
+
+
+def apply_equipped_slot_offset(slot: dict[str, Any], offset: tuple[float, float]) -> dict[str, Any]:
+    shifted = dict(slot)
+    shifted["x"] = float(slot["x"]) + float(offset[0])
+    shifted["y"] = float(slot["y"]) + float(offset[1])
+    return shifted
+
+
+def equipped_slot_manual_click_delay(config: dict[str, Any]) -> float:
+    advance = config.get("advance", {})
+    detect_config = detected_items_config(config)
+    return float(
+        advance.get(
+            "equipped_slot_manual_click_delay_seconds",
+            detect_config.get("manual_page_click_delay_seconds", 0.75),
+        )
+    )
+
+
+def estimate_equipped_slot_offset_from_manual_click(
+    before_image: Any,
+    after_image: Any,
+    slot: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[tuple[float, float], dict[str, Any] | None]:
+    detected_box, detected_count = detect_nearest_equipped_slot_box(after_image, slot, config)
+    if detected_box is not None:
+        detected_center = detected_box["center"]
+        offset = (
+            float(detected_center[0]) - float(slot["x"]),
+            float(detected_center[1]) - float(slot["y"]),
+        )
+        detection = {
+            "method": "equipped_slot_box_detection",
+            "center": [round(float(detected_center[0]), 1), round(float(detected_center[1]), 1)],
+            "bbox": detected_box.get("bbox"),
+            "detected_label": detected_item_box_grid_label(detected_box),
+            "detected_cards": detected_count,
+            "nearest_to_configured_slot": True,
+        }
+        max_offset = float(config.get("advance", {}).get("equipped_slot_manual_max_offset_px", 120))
+        if abs(offset[0]) > max_offset or abs(offset[1]) > max_offset:
+            detection["offset_rejected"] = True
+            detection["rejected_offset"] = [round(offset[0], 1), round(offset[1], 1)]
+            return (0.0, 0.0), detection
+        return offset, detection
+
+    detection = find_changed_region_between_images(
+        before_image,
+        after_image,
+        float(slot["x"]),
+        float(slot["y"]),
+        config,
+    )
+    if detection is None:
+        return (0.0, 0.0), None
+
+    detection["method"] = "changed_region"
+    detected_center = detection["center"]
+    offset = (
+        float(detected_center[0]) - float(slot["x"]),
+        float(detected_center[1]) - float(slot["y"]),
+    )
+    max_offset = float(config.get("advance", {}).get("equipped_slot_manual_max_offset_px", 120))
+    if abs(offset[0]) > max_offset or abs(offset[1]) > max_offset:
+        detection["offset_rejected"] = True
+        detection["rejected_offset"] = [round(offset[0], 1), round(offset[1], 1)]
+        return (0.0, 0.0), detection
+    return offset, detection
+
+
+def detected_verified_scroll_actions(config: dict[str, Any]) -> list[dict[str, Any]]:
+    detect_config = detected_items_config(config)
+    backend = detected_items_input_backend(config)
+    scroll_actions = detect_config.get("verified_scroll_actions", detect_config.get("all_items_scroll_actions", []))
+    if not isinstance(scroll_actions, list):
+        raise AutomationError("advance.detect_items.verified_scroll_actions must be a list.")
+    return [action_for_input_backend(action, backend) for action in scroll_actions]
+
+
 def detected_row_snap_action(config: dict[str, Any], delta_y: float) -> dict[str, Any]:
     detect_config = detected_items_config(config)
     region = parse_rect(detect_config.get("region"), "advance.detect_items.region")
@@ -2559,7 +3529,10 @@ def snap_detected_item_rows_after_scroll(
 def item_detection_mask_pixel(rgb: tuple[int, int, int], detect_config: dict[str, Any]) -> bool:
     r, g, b = rgb
     green = detect_config.get("green_threshold", {})
+    dark_green = detect_config.get("dark_green_threshold", {})
     orange = detect_config.get("orange_threshold", {})
+    dark_orange = detect_config.get("dark_orange_threshold", {})
+    colored_card = detect_config.get("colored_card_threshold", {})
     mint = detect_config.get("mint_threshold", {})
 
     green_match = (
@@ -2567,17 +3540,54 @@ def item_detection_mask_pixel(rgb: tuple[int, int, int], detect_config: dict[str
         and r <= int(green.get("max_r", 125))
         and b >= int(green.get("min_b", 70))
     )
+    dark_green_match = (
+        g >= int(dark_green.get("min_g", 75))
+        and r <= int(dark_green.get("max_r", 90))
+        and b <= int(dark_green.get("max_b", 110))
+        and g >= r + int(dark_green.get("min_g_over_r", 20))
+        and g >= b + int(dark_green.get("min_g_over_b", 5))
+    )
     orange_match = (
         r >= int(orange.get("min_r", 180))
         and g >= int(orange.get("min_g", 110))
         and b <= int(orange.get("max_b", 130))
+    )
+    dark_orange_match = (
+        r >= int(dark_orange.get("min_r", 70))
+        and g >= int(dark_orange.get("min_g", 45))
+        and b <= int(dark_orange.get("max_b", 90))
+        and r >= g + int(dark_orange.get("min_r_over_g", 8))
+        and g >= b + int(dark_orange.get("min_g_over_b", 5))
     )
     mint_match = (
         g >= int(mint.get("min_g", 170))
         and b >= int(mint.get("min_b", 120))
         and r <= int(mint.get("max_r", 180))
     )
-    return green_match or orange_match or mint_match
+    channel_max = max(r, g, b)
+    channel_min = min(r, g, b)
+    saturation = channel_max - channel_min
+    neutral_tolerance = int(colored_card.get("neutral_tolerance", 12))
+    neutral_min_value = int(colored_card.get("neutral_min_value", 145))
+    neutral_match = (
+        abs(r - g) <= neutral_tolerance
+        and abs(g - b) <= neutral_tolerance
+        and abs(r - b) <= neutral_tolerance
+        and channel_max >= neutral_min_value
+    )
+    colored_card_match = (
+        bool(colored_card.get("enabled", True))
+        and channel_max <= int(colored_card.get("max_value", 245))
+        and not neutral_match
+        and (
+            saturation >= int(colored_card.get("min_saturation", 18))
+            or (
+                channel_max <= int(colored_card.get("dark_max_value", 130))
+                and saturation >= int(colored_card.get("dark_min_saturation", 8))
+            )
+        )
+    )
+    return green_match or dark_green_match or orange_match or dark_orange_match or mint_match or colored_card_match
 
 
 def find_mask_components(mask: bytearray, width: int, height: int) -> list[dict[str, Any]]:
@@ -2689,6 +3699,54 @@ def detected_item_row_index(center_y: float, row_centers: list[float], tolerance
     if abs(nearest_y - center_y) <= tolerance:
         return nearest_index
     return None
+
+
+def detected_item_row_spacing(row_centers: list[float]) -> float | None:
+    if len(row_centers) < 2:
+        return None
+    deltas = [
+        float(row_centers[index + 1]) - float(row_centers[index])
+        for index in range(len(row_centers) - 1)
+        if float(row_centers[index + 1]) > float(row_centers[index])
+    ]
+    if not deltas:
+        return None
+    return median_number(deltas)
+
+
+def assign_detected_item_grid_indexes(
+    signed_boxes: list[dict[str, Any]],
+    row_centers: list[float],
+    config: dict[str, Any],
+) -> None:
+    detect_config = detected_items_config(config)
+    row_tolerance = float(detect_config.get("row_group_tolerance_px", 35))
+    rows: dict[int, list[dict[str, Any]]] = {}
+
+    for ordinal, box in enumerate(sorted(signed_boxes, key=lambda item: (item["center"][1], item["center"][0])), start=1):
+        box["viewport_ordinal"] = ordinal
+        row_index = box.get("row_index")
+        if row_index is None:
+            row_index = detected_item_row_index(float(box["center"][1]), row_centers, row_tolerance)
+            if row_index is not None:
+                box["row_index"] = row_index
+        if row_index is not None:
+            rows.setdefault(int(row_index), []).append(box)
+
+    for row_index, row_boxes in rows.items():
+        for column_index, box in enumerate(sorted(row_boxes, key=lambda item: item["center"][0]), start=1):
+            box["column_index"] = column_index - 1
+
+
+def detected_item_box_grid_label(box: dict[str, Any]) -> str:
+    row_index = box.get("row_index")
+    column_index = box.get("column_index")
+    if row_index is not None and column_index is not None:
+        return f"r{int(row_index) + 1}c{int(column_index) + 1}"
+    ordinal = box.get("viewport_ordinal")
+    if ordinal is not None:
+        return f"item{int(ordinal)}"
+    return "item?"
 
 
 def detected_calibration_boxes(boxes: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2866,25 +3924,15 @@ def seen_signature_match(
     return False, best_distance, best_color_distance
 
 
-def split_unseen_detected_item_boxes(
+def signed_detected_item_boxes(
     image: Any,
     boxes: list[dict[str, Any]],
     seen_signatures: list[dict[str, Any]],
     config: dict[str, Any],
-    skip_row_limit: int | None = None,
     row_centers: list[float] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> list[dict[str, Any]]:
     detect_config = detected_items_config(config)
-    if not bool(detect_config.get("skip_seen_cards", True)):
-        signed_boxes = []
-        for box in boxes:
-            signed = dict(box)
-            signed["signature"] = detected_item_card_signature(image, box, config)
-            signed_boxes.append(signed)
-        return signed_boxes, []
-
     signed_boxes: list[dict[str, Any]] = []
-    matched_counts_by_row: dict[int, int] = {}
     for box in boxes:
         signed = dict(box)
         signature = detected_item_card_signature(image, box, config)
@@ -2901,9 +3949,30 @@ def split_unseen_detected_item_boxes(
             signed["signature_distance"] = distance
         if color_distance is not None:
             signed["signature_color_distance"] = round(color_distance, 2)
+        signed_boxes.append(signed)
+    return signed_boxes
+
+
+def split_unseen_detected_item_boxes(
+    image: Any,
+    boxes: list[dict[str, Any]],
+    seen_signatures: list[dict[str, Any]],
+    config: dict[str, Any],
+    skip_row_limit: int | None = None,
+    row_centers: list[float] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    detect_config = detected_items_config(config)
+    if not bool(detect_config.get("skip_seen_cards", True)):
+        signed_boxes = signed_detected_item_boxes(image, boxes, [], config, row_centers)
+        return signed_boxes, []
+
+    matched_counts_by_row: dict[int, int] = {}
+    signed_boxes = signed_detected_item_boxes(image, boxes, seen_signatures, config, row_centers)
+    for signed in signed_boxes:
+        matched = bool(signed.get("seen_signature_match"))
+        row_index = signed.get("row_index")
         if matched and row_index is not None:
             matched_counts_by_row[row_index] = matched_counts_by_row.get(row_index, 0) + 1
-        signed_boxes.append(signed)
 
     min_matches_per_row = int(detect_config.get("skip_seen_min_matches_per_row", 2))
     skippable_rows = {
@@ -2926,6 +3995,569 @@ def split_unseen_detected_item_boxes(
                 signed["seen_match_ignored"] = True
             unseen.append(signed)
     return unseen, skipped
+
+
+def detected_item_signature_id(signature: dict[str, Any]) -> str:
+    value = str(signature.get("hash", ""))
+    return value[:12] if value else ""
+
+
+def detected_viewport_id(signed_boxes: list[dict[str, Any]]) -> str:
+    parts = [
+        f"{detected_item_signature_id(box.get('signature', {}))}:{int(round(float(box['center'][0])))}:{int(round(float(box['center'][1])))}"
+        for box in sorted(signed_boxes, key=lambda item: (item["center"][1], item["center"][0]))
+    ]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def best_previous_signed_box_match(
+    signature: dict[str, Any],
+    previous_boxes: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[dict[str, Any] | None, int | None, float | None]:
+    detect_config = detected_items_config(config)
+    hamming_threshold = int(detect_config.get("signature_hamming_threshold", 90))
+    color_threshold = float(detect_config.get("signature_color_distance_threshold", 90))
+    best_box: dict[str, Any] | None = None
+    best_distance: int | None = None
+    best_color_distance: float | None = None
+
+    for previous in previous_boxes:
+        previous_signature = previous.get("signature")
+        if not isinstance(previous_signature, dict):
+            continue
+        distance = signature_hamming_distance(signature, previous_signature)
+        color_distance = signature_color_distance(signature, previous_signature)
+        if best_distance is None or (distance, color_distance) < (best_distance, best_color_distance or 10**9):
+            best_box = previous
+            best_distance = distance
+            best_color_distance = color_distance
+
+    if (
+        best_box is not None
+        and best_distance is not None
+        and best_color_distance is not None
+        and best_distance <= hamming_threshold
+        and best_color_distance <= color_threshold
+    ):
+        return best_box, best_distance, best_color_distance
+    return None, best_distance, best_color_distance
+
+
+def detected_viewport_progress(
+    previous_boxes: list[dict[str, Any]] | None,
+    current_boxes: list[dict[str, Any]],
+    config: dict[str, Any],
+    row_spacing: float | None,
+) -> dict[str, Any] | None:
+    if not previous_boxes:
+        return None
+
+    matches: list[dict[str, Any]] = []
+    for current in current_boxes:
+        signature = current.get("signature")
+        if not isinstance(signature, dict):
+            continue
+        previous, distance, color_distance = best_previous_signed_box_match(signature, previous_boxes, config)
+        if previous is None:
+            continue
+        previous_center = previous["center"]
+        current_center = current["center"]
+        shift_y = float(previous_center[1]) - float(current_center[1])
+        match = {
+            "previous": detected_item_box_grid_label(previous),
+            "current": detected_item_box_grid_label(current),
+            "previous_center": [round(float(previous_center[0]), 1), round(float(previous_center[1]), 1)],
+            "current_center": [round(float(current_center[0]), 1), round(float(current_center[1]), 1)],
+            "shift_y": round(shift_y, 1),
+            "hamming_distance": distance,
+            "color_distance": round(color_distance, 2) if color_distance is not None else None,
+        }
+        if row_spacing:
+            match["shift_rows"] = round(shift_y / row_spacing, 2)
+        matches.append(match)
+
+    shifts = [float(match["shift_y"]) for match in matches]
+    median_shift = median_number(shifts) if shifts else None
+    result: dict[str, Any] = {
+        "previous_visible_count": len(previous_boxes),
+        "current_visible_count": len(current_boxes),
+        "matched_previous_count": len(matches),
+        "matches": matches,
+    }
+    if median_shift is not None:
+        result["median_shift_y"] = round(median_shift, 1)
+        if row_spacing:
+            result["median_shift_rows"] = round(median_shift / row_spacing, 2)
+    return result
+
+
+def detected_item_box_status(
+    box: dict[str, Any],
+    boxes_to_click: list[dict[str, Any]],
+    skipped_boxes: list[dict[str, Any]],
+) -> str:
+    if box.get("manual_selected"):
+        return "manual_start"
+    center = tuple(box.get("center", []))
+    click_centers = {tuple(item.get("center", [])) for item in boxes_to_click}
+    skipped_centers = {tuple(item.get("center", [])) for item in skipped_boxes}
+    if center in skipped_centers:
+        return "seen_skip"
+    if center in click_centers:
+        if box.get("seen_match_ignored"):
+            return "tap_seen_match"
+        return "tap"
+    if box.get("seen_match_ignored"):
+        return "seen_match_ignored"
+    return "visible"
+
+
+def prepare_detected_viewport(
+    image: Any,
+    boxes: list[dict[str, Any]],
+    seen_signatures: list[dict[str, Any]],
+    config: dict[str, Any],
+    skip_row_limit: int | None,
+    previous_signed_boxes: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[float], dict[str, Any] | None]:
+    detect_config = detected_items_config(config)
+    group_tolerance = float(detect_config.get("row_group_tolerance_px", 35))
+    row_centers = detected_item_row_centers(boxes, group_tolerance)
+    boxes_to_click, skipped_boxes = split_unseen_detected_item_boxes(
+        image,
+        boxes,
+        seen_signatures,
+        config,
+        skip_row_limit=skip_row_limit,
+        row_centers=row_centers,
+    )
+    signed_boxes = sorted([*boxes_to_click, *skipped_boxes], key=lambda item: (item["center"][1], item["center"][0]))
+    assign_detected_item_grid_indexes(signed_boxes, row_centers, config)
+    progress = detected_viewport_progress(
+        previous_signed_boxes,
+        signed_boxes,
+        config,
+        detected_item_row_spacing(row_centers),
+    )
+    return signed_boxes, boxes_to_click, skipped_boxes, row_centers, progress
+
+
+def prepare_manual_detected_viewport(
+    boxes: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[float]]:
+    detect_config = detected_items_config(config)
+    group_tolerance = float(detect_config.get("row_group_tolerance_px", 35))
+    row_centers = detected_item_row_centers(boxes, group_tolerance)
+    signed_boxes = [dict(box) for box in sorted(boxes, key=lambda item: (item["center"][1], item["center"][0]))]
+    assign_detected_item_grid_indexes(signed_boxes, row_centers, config)
+    return signed_boxes, row_centers
+
+
+def changed_pixels_in_bbox(
+    before_image: Any,
+    after_image: Any,
+    bbox: list[float] | tuple[float, float, float, float],
+    config: dict[str, Any],
+) -> int:
+    if before_image.size != after_image.size:
+        raise AutomationError("Manual selection screenshots have different sizes.")
+
+    detect_config = detected_items_config(config)
+    threshold = max(0, int(detect_config.get("manual_selection_diff_threshold", 18)))
+    margin = max(0, int(detect_config.get("manual_selection_bbox_margin_px", 6)))
+    width, height = before_image.size
+    left = max(0, int(float(bbox[0])) - margin)
+    top = max(0, int(float(bbox[1])) - margin)
+    right = min(width, int(round(float(bbox[2]))) + margin)
+    bottom = min(height, int(round(float(bbox[3]))) + margin)
+    if right <= left or bottom <= top:
+        return 0
+
+    ImageChops = require_package("PIL.ImageChops", "Pillow")
+    before_crop = before_image.crop((left, top, right, bottom)).convert("RGB")
+    after_crop = after_image.crop((left, top, right, bottom)).convert("RGB")
+    diff = ImageChops.difference(before_crop, after_crop).tobytes()
+    changed = 0
+    for index in range(0, len(diff), 3):
+        if diff[index] >= threshold or diff[index + 1] >= threshold or diff[index + 2] >= threshold:
+            changed += 1
+    return changed
+
+
+def detect_manual_selected_box(
+    before_image: Any,
+    after_image: Any,
+    signed_boxes: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if not signed_boxes:
+        raise AutomationError("No visible equipment cards were detected after your manual click.")
+
+    detect_config = detected_items_config(config)
+    minimum_changed = int(detect_config.get("manual_selection_min_changed_pixels", 35))
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for box in signed_boxes:
+        bbox = box.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        changed = changed_pixels_in_bbox(before_image, after_image, bbox, config)
+        box["manual_selection_changed_pixels"] = changed
+        scored.append((changed, box))
+
+    if not scored:
+        raise AutomationError("Detected equipment cards did not include usable bounding boxes.")
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_changed, selected = scored[0]
+    if best_changed < minimum_changed:
+        raise AutomationError(
+            "Could not identify which equipment card you clicked. "
+            f"Best changed-pixel score was {best_changed}, below {minimum_changed}."
+        )
+
+    selected["manual_selected"] = True
+    return selected
+
+
+def boxes_after_manual_selection(
+    signed_boxes: list[dict[str, Any]],
+    selected_box: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_row = selected_box.get("row_index")
+    selected_column = selected_box.get("column_index")
+    if selected_row is not None and selected_column is not None:
+        row = int(selected_row)
+        column = int(selected_column)
+        return sorted(
+            [
+                box
+                for box in signed_boxes
+                if box is not selected_box
+                and box.get("row_index") is not None
+                and box.get("column_index") is not None
+                and (
+                    int(box["row_index"]) > row
+                    or (int(box["row_index"]) == row and int(box["column_index"]) > column)
+                )
+            ],
+            key=lambda item: (int(item["row_index"]), int(item["column_index"])),
+        )
+
+    selected_ordinal = selected_box.get("viewport_ordinal")
+    if selected_ordinal is None:
+        return []
+    return sorted(
+        [
+            box
+            for box in signed_boxes
+            if box is not selected_box and box.get("viewport_ordinal") is not None and int(box["viewport_ordinal"]) > int(selected_ordinal)
+        ],
+        key=lambda item: int(item["viewport_ordinal"]),
+    )
+
+
+def write_detected_viewport_debug(
+    config: dict[str, Any],
+    debug_dir: Path | None,
+    label: str,
+    image: Any,
+    signed_boxes: list[dict[str, Any]],
+    boxes_to_click: list[dict[str, Any]],
+    skipped_boxes: list[dict[str, Any]],
+    row_centers: list[float],
+    progress: dict[str, Any] | None,
+) -> tuple[Path | None, Path | None]:
+    detect_config = detected_items_config(config)
+    if debug_dir is None or not bool(detect_config.get("page_diagnostics", False)):
+        return None, None
+
+    diag_dir = debug_dir / "detected_viewports"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    viewport_id = detected_viewport_id(signed_boxes)
+    stem = f"{safe_filename_part(label)}_{viewport_id}"
+    json_path = diag_dir / f"{stem}.json"
+    image_path = diag_dir / f"{stem}.png"
+
+    boxes_payload = []
+    for box in sorted(signed_boxes, key=lambda item: (item["center"][1], item["center"][0])):
+        center = box["center"]
+        payload = {
+            "label": detected_item_box_grid_label(box),
+            "status": detected_item_box_status(box, boxes_to_click, skipped_boxes),
+            "center": [round(float(center[0]), 1), round(float(center[1]), 1)],
+            "bbox": [round(float(value), 1) for value in box["bbox"]],
+            "row_index": box.get("row_index"),
+            "column_index": box.get("column_index"),
+            "signature": detected_item_signature_id(box.get("signature", {})),
+            "seen_signature_match": bool(box.get("seen_signature_match")),
+        }
+        if box.get("manual_selected"):
+            payload["manual_selected"] = True
+        if box.get("manual_selection_changed_pixels") is not None:
+            payload["manual_selection_changed_pixels"] = box["manual_selection_changed_pixels"]
+        if box.get("signature_distance") is not None:
+            payload["nearest_hamming_distance"] = box["signature_distance"]
+        if box.get("signature_color_distance") is not None:
+            payload["nearest_color_distance"] = box["signature_color_distance"]
+        if box.get("seen_match_ignored"):
+            payload["seen_match_ignored"] = True
+        boxes_payload.append(payload)
+
+    row_spacing = detected_item_row_spacing(row_centers)
+    payload = {
+        "label": label,
+        "viewport_id": viewport_id,
+        "timestamp": dt.datetime.now().isoformat(timespec="milliseconds"),
+        "image_size": list(image.size),
+        "detected_cards": len(signed_boxes),
+        "tap_count": len(boxes_to_click),
+        "seen_skip_count": len(skipped_boxes),
+        "row_centers": [round(float(value), 1) for value in row_centers],
+        "row_spacing": round(row_spacing, 1) if row_spacing is not None else None,
+        "progress_from_previous": progress,
+        "boxes": boxes_payload,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    if bool(detect_config.get("page_diagnostics_images", True)):
+        ImageDraw = require_package("PIL.ImageDraw", "Pillow")
+        annotated = image.copy().convert("RGB")
+        draw = ImageDraw.Draw(annotated)
+        colors = {
+            "tap": (36, 180, 90),
+            "tap_seen_match": (210, 70, 70),
+            "manual_start": (80, 90, 255),
+            "seen_skip": (245, 170, 42),
+            "seen_match_ignored": (210, 70, 70),
+            "visible": (80, 150, 255),
+        }
+        for box_payload in boxes_payload:
+            bbox = box_payload["bbox"]
+            status = box_payload["status"]
+            color = colors.get(status, (80, 150, 255))
+            draw.rectangle(bbox, outline=color, width=4)
+            label_text = f"{box_payload['label']} {status}"
+            text_x = int(float(bbox[0])) + 4
+            text_y = int(float(bbox[1])) + 4
+            draw.rectangle((text_x - 2, text_y - 2, text_x + 132, text_y + 18), fill=(0, 0, 0))
+            draw.text((text_x, text_y), label_text, fill=color)
+        annotated.save(image_path)
+    else:
+        image_path = None
+
+    return json_path, image_path
+
+
+def print_detected_viewport_summary(
+    config: dict[str, Any],
+    label: str,
+    signed_boxes: list[dict[str, Any]],
+    boxes_to_click: list[dict[str, Any]],
+    skipped_boxes: list[dict[str, Any]],
+    row_centers: list[float],
+    progress: dict[str, Any] | None,
+    json_path: Path | None = None,
+    image_path: Path | None = None,
+) -> None:
+    detect_config = detected_items_config(config)
+    viewport_id = detected_viewport_id(signed_boxes)
+    row_text = ", ".join(str(round(float(value), 1)) for value in row_centers) or "none"
+    summary = (
+        f"{label}: id={viewport_id} cards={len(signed_boxes)} rows={len(row_centers)} "
+        f"row_y=[{row_text}] tap={len(boxes_to_click)} seen_skip={len(skipped_boxes)}"
+    )
+    if progress is not None:
+        summary += f" prev_matches={progress.get('matched_previous_count', 0)}"
+        if progress.get("median_shift_y") is not None:
+            summary += f" scroll={progress['median_shift_y']}px"
+        if progress.get("median_shift_rows") is not None:
+            summary += f"/{progress['median_shift_rows']} rows"
+    print(summary)
+
+    min_rows = float(detect_config.get("min_crawl_scroll_rows", 0))
+    if (
+        progress is not None
+        and min_rows > 0
+        and progress.get("matched_previous_count", 0) >= int(detect_config.get("scroll_progress_min_matches", 2))
+        and progress.get("median_shift_rows") is not None
+        and float(progress["median_shift_rows"]) < min_rows
+    ):
+        print(
+            f"  scroll warning: matched cards moved only {progress['median_shift_rows']} rows; "
+            f"target minimum is {min_rows:g}."
+        )
+
+    tap_plan = [
+        (
+            f"{detected_item_box_grid_label(box)}@({float(box['center'][0]):.0f},{float(box['center'][1]):.0f})"
+            + (" seen-match" if box.get("seen_match_ignored") else "")
+        )
+        for box in boxes_to_click
+    ]
+    if tap_plan:
+        print(f"  tap plan: {', '.join(tap_plan)}")
+    if skipped_boxes:
+        skipped_plan = [
+            f"{detected_item_box_grid_label(box)}@({float(box['center'][0]):.0f},{float(box['center'][1]):.0f})"
+            for box in skipped_boxes
+        ]
+        print(f"  skipped seen: {', '.join(skipped_plan)}")
+    if json_path:
+        print(f"  viewport debug: {json_path}")
+    if image_path:
+        print(f"  annotated screenshot: {image_path}")
+
+
+def detected_viewport_scroll_stalled(progress: dict[str, Any] | None, config: dict[str, Any]) -> bool:
+    if progress is None:
+        return False
+    detect_config = detected_items_config(config)
+    matched = int(progress.get("matched_previous_count", 0))
+    min_matches = int(detect_config.get("all_items_stop_min_matched_cards", 4))
+    shift_rows = progress.get("median_shift_rows")
+    if shift_rows is None:
+        return False
+    threshold = float(detect_config.get("all_items_stop_scroll_rows_threshold", 0.5))
+    return matched >= min_matches and abs(float(shift_rows)) <= threshold
+
+
+def crop_detected_items_region(image: Any, config: dict[str, Any]) -> Any:
+    detect_config = detected_items_config(config)
+    region = parse_rect(detect_config.get("region"), "advance.detect_items.region")
+    if region is None:
+        raise AutomationError("advance.detect_items.region is required for detected item image shift.")
+    return crop_image(image, region)
+
+
+def mean_abs_image_difference(left_image: Any, right_image: Any) -> float:
+    ImageChops = require_package("PIL.ImageChops", "Pillow")
+    ImageStat = require_package("PIL.ImageStat", "Pillow")
+    diff = ImageChops.difference(left_image, right_image)
+    return float(ImageStat.Stat(diff).mean[0])
+
+
+def estimate_detected_region_vertical_shift(
+    previous_image: Any,
+    current_image: Any,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    detect_config = detected_items_config(config)
+    previous_crop = crop_detected_items_region(previous_image, config).convert("L")
+    current_crop = crop_detected_items_region(current_image, config).convert("L")
+
+    resize_width = int(detect_config.get("viewport_shift_resize_width", 160))
+    step_px = max(1, int(detect_config.get("viewport_shift_search_step_px", 4)))
+    max_shift_px = int(detect_config.get("viewport_shift_max_px", 900))
+    min_overlap_ratio = float(detect_config.get("viewport_shift_min_overlap_ratio", 0.45))
+
+    width, height = previous_crop.size
+    if width <= 0 or height <= 0:
+        return None
+    if resize_width > 0 and width > resize_width:
+        scale = resize_width / width
+        resized_height = max(1, int(round(height * scale)))
+        previous_crop = previous_crop.resize((resize_width, resized_height))
+        current_crop = current_crop.resize((resize_width, resized_height))
+        scale_y = height / resized_height
+    else:
+        scale_y = 1.0
+
+    width, height = previous_crop.size
+    max_shift = min(height - 1, max(0, int(round(max_shift_px / scale_y))))
+    min_overlap = max(1, int(round(height * min_overlap_ratio)))
+    baseline = mean_abs_image_difference(previous_crop, current_crop)
+
+    best_shift = 0
+    best_score = baseline
+    scores: list[tuple[int, float]] = [(0, baseline)]
+    for shift in range(step_px, max_shift + 1, step_px):
+        overlap_height = height - shift
+        if overlap_height < min_overlap:
+            break
+        previous_band = previous_crop.crop((0, shift, width, height))
+        current_band = current_crop.crop((0, 0, width, overlap_height))
+        score = mean_abs_image_difference(previous_band, current_band)
+        scores.append((shift, score))
+        if score < best_score:
+            best_shift = shift
+            best_score = score
+
+    full_shift = best_shift * scale_y
+    improvement = baseline - best_score
+    return {
+        "shift_y": round(full_shift, 1),
+        "score": round(best_score, 3),
+        "baseline_score": round(baseline, 3),
+        "improvement": round(improvement, 3),
+        "scale_y": round(scale_y, 4),
+        "sampled_scores": len(scores),
+    }
+
+
+def detected_region_shift_rows(shift: dict[str, Any] | None, row_centers: list[float]) -> float | None:
+    if shift is None:
+        return None
+    row_spacing = detected_item_row_spacing(row_centers)
+    if not row_spacing:
+        return None
+    return float(shift["shift_y"]) / row_spacing
+
+
+def detected_box_signatures_match(left_box: dict[str, Any] | None, right_box: dict[str, Any] | None, config: dict[str, Any]) -> bool:
+    if not left_box or not right_box:
+        return False
+    left_signature = left_box.get("signature")
+    right_signature = right_box.get("signature")
+    if not isinstance(left_signature, dict) or not isinstance(right_signature, dict):
+        return False
+    matched, _distance, _color_distance = seen_signature_match(left_signature, [right_signature], config)
+    return matched
+
+
+def configured_tap_retry_offsets(config: dict[str, Any]) -> list[tuple[float, float]]:
+    detect_config = detected_items_config(config)
+    offsets = detect_config.get("tap_retry_offsets", [[0, 0]])
+    if not isinstance(offsets, list) or not offsets:
+        return [(0.0, 0.0)]
+    parsed: list[tuple[float, float]] = []
+    for offset in offsets:
+        if isinstance(offset, list) and len(offset) == 2:
+            parsed.append((float(offset[0]), float(offset[1])))
+    return parsed or [(0.0, 0.0)]
+
+
+def detected_item_action_with_offset(config: dict[str, Any], center: tuple[float, float], offset: tuple[float, float]) -> dict[str, Any]:
+    return detected_item_action(config, (center[0] + offset[0], center[1] + offset[1]))
+
+
+def should_retry_unchanged_equipment_tap(
+    config: dict[str, Any],
+    identity_key: str | None,
+    image_hash_value: str,
+    previous_identity_key: str | None,
+    previous_image_hash: str | None,
+    current_box: dict[str, Any],
+    previous_displayed_box: dict[str, Any] | None,
+    attempt_index: int,
+    max_retries: int,
+) -> bool:
+    detect_config = detected_items_config(config)
+    if not bool(detect_config.get("verify_tap_changed_equipment", True)):
+        return False
+    if attempt_index >= max_retries:
+        return False
+    same_details = False
+    if identity_key and previous_identity_key and identity_key == previous_identity_key:
+        same_details = True
+    if image_hash_value and previous_image_hash and image_hash_value == previous_image_hash:
+        same_details = True
+    if not same_details:
+        return False
+    if detected_box_signatures_match(current_box, previous_displayed_box, config):
+        return False
+    return True
 
 
 def detected_item_click_actions_from_screenshot(config: dict[str, Any]) -> tuple[list[dict[str, Any]], Any, list[dict[str, Any]]]:
@@ -3043,12 +4675,123 @@ def run_tap_page_test(
         run_advance_action_group(config, actions, snapshotter, f"tap_page_step_{step_index:04d}")
 
 
+def all_items_scroll_strategy(config: dict[str, Any]) -> str:
+    strategy = str(detected_items_config(config).get("all_items_scroll_strategy", "fixed"))
+    if strategy not in {"fixed", "verified_row_step"}:
+        raise AutomationError("advance.detect_items.all_items_scroll_strategy must be one of: fixed, verified_row_step")
+    return strategy
+
+
+def advance_after_detected_viewport(
+    config: dict[str, Any],
+    scroll_mode: str,
+    previous_image: Any,
+    previous_signed_boxes: list[dict[str, Any]],
+    snapshotter: MovementSnapshotter | None,
+    label_prefix: str,
+    snap_target_rows: list[float] | None = None,
+) -> bool:
+    detect_config = detected_items_config(config)
+    if scroll_mode != "all" or all_items_scroll_strategy(config) == "fixed":
+        scroll_actions = detected_page_scroll_actions(config, scroll_mode)
+        if not scroll_actions:
+            raise AutomationError("No detected page scroll actions configured.")
+        print("Scroll after viewport:")
+        for action in scroll_actions:
+            print(f"  {describe_advance_action(config, action)}")
+        run_advance_action_group(config, scroll_actions, snapshotter, f"{label_prefix}_scroll")
+        snap_detected_item_rows_after_scroll(
+            config,
+            snap_target_rows,
+            snapshotter,
+            f"{label_prefix}_scroll_snap",
+        )
+        return True
+
+    scroll_actions = detected_verified_scroll_actions(config)
+    if not scroll_actions:
+        raise AutomationError("No verified all-items scroll actions configured.")
+
+    target_rows = float(detect_config.get("verified_scroll_target_rows", 2.0))
+    max_attempts = max(1, int(detect_config.get("verified_scroll_max_attempts", 5)))
+    best_shift_rows: float | None = None
+
+    for attempt_index in range(max_attempts):
+        print(f"Verified row-step scroll {attempt_index + 1}/{max_attempts}; target={target_rows:g} rows:")
+        for action in scroll_actions:
+            print(f"  {describe_advance_action(config, action)}")
+        run_advance_action_group(
+            config,
+            scroll_actions,
+            snapshotter,
+            f"{label_prefix}_verified_scroll_{attempt_index + 1:04d}",
+        )
+
+        image = capture_screenshot(config)
+        boxes = detect_visible_item_boxes(image, config)
+        signed_boxes, _boxes_to_click, _skipped_boxes, row_centers, progress = prepare_detected_viewport(
+            image,
+            boxes,
+            [],
+            config,
+            -1,
+            previous_signed_boxes,
+        )
+        image_shift = estimate_detected_region_vertical_shift(previous_image, image, config)
+        image_shift_rows = detected_region_shift_rows(image_shift, row_centers)
+        progress_matches = int(progress.get("matched_previous_count", 0)) if progress is not None else 0
+        if image_shift_rows is not None:
+            best_shift_rows = image_shift_rows
+            progress_text = (
+                f"{best_shift_rows:.2f} rows by image shift "
+                f"({image_shift['shift_y']}px, score={image_shift['score']}, baseline={image_shift['baseline_score']}, "
+                f"fingerprint_matches={progress_matches})"
+            )
+        elif image_shift is not None:
+            progress_text = (
+                f"{image_shift['shift_y']}px by image shift, row spacing unavailable "
+                f"(score={image_shift['score']}, baseline={image_shift['baseline_score']}, "
+                f"fingerprint_matches={progress_matches})"
+            )
+        else:
+            progress_text = f"image shift unavailable, fingerprint_matches={progress_matches}"
+        print(
+            f"  observed after scroll: cards={len(signed_boxes)} rows={len(row_centers)} "
+            f"movement={progress_text}"
+        )
+
+        if best_shift_rows is not None and best_shift_rows >= target_rows:
+            print(f"  verified scroll target reached: {best_shift_rows:.2f} rows.")
+            return True
+        if best_shift_rows is not None and abs(best_shift_rows) <= float(detect_config.get("all_items_stop_scroll_rows_threshold", 0.5)):
+            print("  image shift shows little movement; continuing with another small scroll.")
+            continue
+
+        if image_shift is None:
+            print("  image shift was unavailable; continuing with another small scroll.")
+            continue
+
+        if image_shift_rows is None:
+            print("  row spacing unavailable; stopping before re-clicking an unverified viewport.")
+            return False
+
+    if best_shift_rows is None:
+        print("  verified scroll ended without a measured row movement; stopping before re-clicking.")
+    else:
+        print(
+            f"  verified scroll max attempts reached at {best_shift_rows:.2f} rows, "
+            f"below target={target_rows:g}; stopping before re-clicking."
+        )
+    return False
+
+
 def run_tap_detected_page_test(
     config: dict[str, Any],
     page_count: int | None,
     snapshotter: MovementSnapshotter | None = None,
     calibration_delay: float | None = None,
     calibrate_desktop: bool = True,
+    debug_dir: Path | None = None,
 ) -> None:
     if page_count is not None and page_count < 1:
         raise AutomationError("--tap-detected-page-test must be at least 1.")
@@ -3064,6 +4807,7 @@ def run_tap_detected_page_test(
     log_detected_items = bool(detect_config.get("log_detected_items", False))
     seen_card_signatures: list[dict[str, Any]] = []
     snap_target_rows: list[float] | None = None
+    previous_signed_boxes: list[dict[str, Any]] | None = None
     total_clicked = 0
 
     if page_count is None:
@@ -3084,43 +4828,55 @@ def run_tap_detected_page_test(
         while True:
             image = capture_screenshot(config)
             boxes = detect_visible_item_boxes(image, config)
-            needs_row_centers = row_snap_enabled or (page_index > 0 and skip_seen_rows_after_scroll >= 0)
-            row_centers: list[float] = []
-            if needs_row_centers:
-                group_tolerance = float(detect_config.get("row_group_tolerance_px", 35))
-                row_centers = detected_item_row_centers(boxes, group_tolerance)
-            if row_snap_enabled and page_index == 0 and snap_target_rows is None and boxes:
-                snap_target_rows = row_centers
-                print(f"Row snap target centers: {[round(value, 1) for value in snap_target_rows]}")
             skip_row_limit = None
             if page_index > 0:
                 if page_count is None and skip_seen_rows_after_crawl >= 0:
                     skip_row_limit = skip_seen_rows_after_crawl
                 elif page_count is not None and skip_seen_rows_after_scroll >= 0:
                     skip_row_limit = skip_seen_rows_after_scroll
-            boxes_to_click, skipped_boxes = split_unseen_detected_item_boxes(
+            signed_boxes, boxes_to_click, skipped_boxes, row_centers, progress = prepare_detected_viewport(
                 image,
                 boxes,
                 seen_card_signatures,
                 config,
-                skip_row_limit=skip_row_limit,
-                row_centers=row_centers,
+                skip_row_limit,
+                previous_signed_boxes,
             )
             actions = [detected_item_action(config, tuple(box["center"])) for box in boxes_to_click]
 
-            print(
-                f"Page {page_index + 1}: detected {len(boxes)} visible item cards; "
-                f"clicking {len(actions)}"
+            if row_snap_enabled and page_index == 0 and snap_target_rows is None and boxes:
+                snap_target_rows = row_centers
+                print(f"Row snap target centers: {[round(value, 1) for value in snap_target_rows]}")
+            viewport_label = f"tap_detected_{'all' if page_count is None else 'page'}_{page_index + 1:04d}"
+            if extra_scrolls:
+                viewport_label += f"_extra_{extra_scrolls:04d}"
+            json_path, image_path = write_detected_viewport_debug(
+                config,
+                debug_dir,
+                viewport_label,
+                image,
+                signed_boxes,
+                boxes_to_click,
+                skipped_boxes,
+                row_centers,
+                progress,
             )
-            if log_detected_items and row_centers:
-                print(f"  row centers: {[round(value, 1) for value in row_centers]}")
-            if skipped_boxes:
-                print(f"  skipped already-seen cards: {len(skipped_boxes)}")
+            print_detected_viewport_summary(
+                config,
+                f"Viewport {page_index + 1}",
+                signed_boxes,
+                boxes_to_click,
+                skipped_boxes,
+                row_centers,
+                progress,
+                json_path,
+                image_path,
+            )
             if log_detected_items:
                 skipped_centers = {tuple(skipped.get("center", [])) for skipped in skipped_boxes}
                 signed_by_center = {
                     tuple(signed.get("center", [])): signed
-                    for signed in [*boxes_to_click, *skipped_boxes]
+                    for signed in signed_boxes
                 }
                 for number, box in enumerate(boxes, start=1):
                     center = box["center"]
@@ -3148,6 +4904,14 @@ def run_tap_detected_page_test(
                     return
                 raise AutomationError("No visible equipment item cards detected. Check advance.detect_items.region.")
 
+            if page_count is None and page_index > 0 and detected_viewport_scroll_stalled(progress, config):
+                print(
+                    "Scroll appears stalled at the same viewport; stopping all-items test "
+                    "before re-clicking repeated cards."
+                )
+                print(f"Total clicked: {total_clicked}")
+                return
+
             should_scroll_again = (
                 page_index > 0
                 and skip_seen_cards
@@ -3166,6 +4930,7 @@ def run_tap_detected_page_test(
             )
             for action in scroll_actions:
                 print(f"  {describe_advance_action(config, action)}")
+            previous_signed_boxes = signed_boxes
             run_advance_action_group(
                 config,
                 scroll_actions,
@@ -3200,7 +4965,11 @@ def run_tap_detected_page_test(
             did_calibrate = True
 
         for item_index, action in enumerate(actions, start=1):
-            print(f"Click page {page_index + 1} item {item_index}: {describe_advance_action(config, action)}")
+            box = boxes_to_click[item_index - 1]
+            print(
+                f"Click viewport {page_index + 1} {detected_item_box_grid_label(box)}: "
+                f"{describe_advance_action(config, action)}"
+            )
             run_advance_action_group(
                 config,
                 [action],
@@ -3214,24 +4983,19 @@ def run_tap_detected_page_test(
 
         should_scroll_to_next_page = page_count is None or page_index < page_count - 1
         if should_scroll_to_next_page:
-            scroll_actions = detected_page_scroll_actions(config, scroll_mode)
-            if not scroll_actions:
-                raise AutomationError("No detected page scroll actions configured.")
-            print(f"Scroll after page {page_index + 1}:")
-            for action in scroll_actions:
-                print(f"  {describe_advance_action(config, action)}")
-            run_advance_action_group(
+            previous_signed_boxes = signed_boxes
+            advanced = advance_after_detected_viewport(
                 config,
-                scroll_actions,
+                scroll_mode,
+                image,
+                previous_signed_boxes,
                 snapshotter,
-                f"tap_detected_page_{page_index + 1:04d}_scroll",
-            )
-            snap_detected_item_rows_after_scroll(
-                config,
+                f"tap_detected_page_{page_index + 1:04d}",
                 snap_target_rows,
-                snapshotter,
-                f"tap_detected_page_{page_index + 1:04d}_scroll_snap",
             )
+            if not advanced:
+                print("Stopping detected tap test because verified scroll did not reach the next viewport.")
+                return
         page_index += 1
 
     print(f"Total clicked: {total_clicked}")
@@ -3416,8 +5180,8 @@ def analyze_movement_snapshots(manifest_path: Path, config: dict[str, Any]) -> d
     suggestions_by_action: dict[tuple[float, float], list[tuple[float, float]]] = {}
 
     for label, phases in sorted(by_label.items()):
-        before_entry = phases.get("before_click")
-        click_entry = phases.get("after_click") or phases.get("click_down")
+        before_entry = phases.get("before_click") or phases.get("before_adb_tap")
+        click_entry = phases.get("after_click") or phases.get("click_down") or phases.get("after_adb_tap")
         if not before_entry or not click_entry:
             continue
 
@@ -3517,6 +5281,303 @@ def print_movement_snapshot_analysis(analysis: dict[str, Any]) -> None:
             print(f"  {entry.get('label', '(unknown)')}: {entry.get('reason')}")
 
 
+def latest_movement_snapshot_manifest(debug_dir: Path) -> Path:
+    manifests = sorted(
+        (debug_dir / "movement_snapshots").glob("*/manifest.json"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if not manifests:
+        raise AutomationError(f"No movement snapshot manifests found under: {debug_dir / 'movement_snapshots'}")
+    return manifests[-1]
+
+
+def resolve_detected_tap_analysis_paths(path: Path) -> tuple[Path, Path]:
+    expanded = path.expanduser()
+    if expanded.is_file():
+        manifest = resolve_snapshot_manifest(expanded)
+        if manifest.parent.parent.name == "movement_snapshots":
+            return manifest.parent.parent.parent, manifest
+        return manifest.parent, manifest
+
+    if (expanded / "manifest.json").exists():
+        manifest = resolve_snapshot_manifest(expanded)
+        if manifest.parent.parent.name == "movement_snapshots":
+            return manifest.parent.parent.parent, manifest
+        return expanded, manifest
+
+    debug_dir = expanded
+    return debug_dir, latest_movement_snapshot_manifest(debug_dir)
+
+
+def load_detected_viewport_records(debug_dir: Path) -> list[dict[str, Any]]:
+    viewport_dir = debug_dir / "detected_viewports"
+    if not viewport_dir.exists():
+        raise AutomationError(f"Detected viewport directory does not exist: {viewport_dir}")
+
+    records: list[dict[str, Any]] = []
+    for json_path in sorted(viewport_dir.glob("*.json"), key=lambda path: (path.stat().st_mtime, path.name)):
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["_path"] = str(json_path)
+        records.append(payload)
+    if not records:
+        raise AutomationError(f"No detected viewport JSON files found under: {viewport_dir}")
+    return records
+
+
+def detected_tap_label_candidates(label: str) -> tuple[list[str], int] | None:
+    tap_match = re.search(r"tap_detected_page_(\d+)_item_(\d+)_action_\d+$", label)
+    if tap_match:
+        page_number = int(tap_match.group(1))
+        item_number = int(tap_match.group(2))
+        page = f"{page_number:04d}"
+        return [f"tap_detected_all_{page}", f"tap_detected_page_{page}"], item_number
+
+    submit_match = re.search(r"submit_detected_page_(\d+)_card_(\d+)_action_\d+$", label)
+    if submit_match:
+        page_number = int(submit_match.group(1))
+        card_number = int(submit_match.group(2))
+        page = f"{page_number:04d}"
+        return [f"submit_detected_all_{page}"], card_number
+    return None
+
+
+def select_detected_viewport_record(
+    viewport_records: list[dict[str, Any]],
+    candidate_labels: list[str],
+    item_number: int,
+) -> dict[str, Any] | None:
+    for candidate in candidate_labels:
+        matches = [
+            record
+            for record in viewport_records
+            if str(record.get("label", "")) == candidate
+            or str(record.get("label", "")).startswith(f"{candidate}_extra_")
+        ]
+        matches = [
+            record
+            for record in matches
+            if int(record.get("tap_count", 0)) >= item_number
+        ]
+        if matches:
+            return matches[-1]
+    return None
+
+
+def detected_viewport_tap_boxes(viewport_record: dict[str, Any]) -> list[dict[str, Any]]:
+    boxes = viewport_record.get("boxes", [])
+    if not isinstance(boxes, list):
+        return []
+    return [
+        box
+        for box in boxes
+        if isinstance(box, dict) and str(box.get("status", "")).startswith("tap")
+    ]
+
+
+def point_in_bbox(point: tuple[float, float], bbox: Any) -> bool:
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return False
+    x, y = point
+    left, top, right, bottom = [float(value) for value in bbox]
+    return left <= x <= right and top <= y <= bottom
+
+
+def nearest_detected_viewport_box(
+    viewport_record: dict[str, Any],
+    point: tuple[float, float],
+) -> tuple[dict[str, Any] | None, float | None]:
+    boxes = viewport_record.get("boxes", [])
+    if not isinstance(boxes, list):
+        return None, None
+
+    containing = [
+        box
+        for box in boxes
+        if isinstance(box, dict) and point_in_bbox(point, box.get("bbox"))
+    ]
+    candidates = containing or [box for box in boxes if isinstance(box, dict)]
+    if not candidates:
+        return None, None
+
+    def distance(box: dict[str, Any]) -> float:
+        center = box.get("center", [0, 0])
+        return ((float(center[0]) - point[0]) ** 2 + (float(center[1]) - point[1]) ** 2) ** 0.5
+
+    nearest = min(candidates, key=distance)
+    return nearest, round(distance(nearest), 2)
+
+
+def analyze_detected_taps(path: Path, config: dict[str, Any]) -> dict[str, Any]:
+    Image = require_package("PIL.Image", "Pillow")
+    debug_dir, manifest = resolve_detected_tap_analysis_paths(path)
+    entries = json.loads(manifest.read_text(encoding="utf-8"))
+    if not isinstance(entries, list):
+        raise AutomationError(f"Movement snapshot manifest must contain a list: {manifest}")
+
+    viewport_records = load_detected_viewport_records(debug_dir)
+    by_label: dict[str, dict[str, dict[str, Any]]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label", ""))
+        phase = str(entry.get("phase", ""))
+        if label and phase:
+            by_label.setdefault(label, {})[phase] = entry
+
+    detections: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+
+    for label, phases in sorted(by_label.items()):
+        parsed_label = detected_tap_label_candidates(label)
+        if parsed_label is None:
+            continue
+        candidate_labels, item_number = parsed_label
+        before_entry = phases.get("before_adb_tap") or phases.get("before_click")
+        click_entry = phases.get("after_adb_tap") or phases.get("after_click") or phases.get("click_down")
+        if not before_entry or not click_entry:
+            unresolved.append({"label": label, "reason": "Missing before/after tap snapshots. Re-run with --movement-snapshots."})
+            continue
+
+        viewport = select_detected_viewport_record(viewport_records, candidate_labels, item_number)
+        if viewport is None:
+            unresolved.append({"label": label, "reason": f"No viewport JSON found for labels {candidate_labels}."})
+            continue
+
+        tap_boxes = detected_viewport_tap_boxes(viewport)
+        if item_number < 1 or item_number > len(tap_boxes):
+            unresolved.append({"label": label, "reason": f"Viewport has {len(tap_boxes)} planned taps; wanted tap {item_number}."})
+            continue
+        intended = tap_boxes[item_number - 1]
+
+        click_point = movement_entry_image_click_point(click_entry)
+        if click_point is None:
+            unresolved.append({"label": label, "reason": "Could not resolve tap point in snapshot image."})
+            continue
+
+        before_path = resolve_snapshot_image_path(manifest, before_entry.get("image"))
+        click_path = resolve_snapshot_image_path(manifest, click_entry.get("image"))
+        if not before_path.exists() or not click_path.exists():
+            unresolved.append({"label": label, "reason": "Snapshot image file is missing."})
+            continue
+
+        before_image = Image.open(before_path).convert("RGB")
+        click_image = Image.open(click_path).convert("RGB")
+        region = find_changed_region_between_images(before_image, click_image, click_point[0], click_point[1], config)
+        if region is None:
+            unresolved.append(
+                {
+                    "label": label,
+                    "reason": "No tap highlight detected near the planned center.",
+                    "viewport_label": viewport.get("label"),
+                    "intended_label": intended.get("label"),
+                    "intended_center": intended.get("center"),
+                }
+            )
+            continue
+
+        detected_full = movement_entry_full_point(click_entry, region["center"][0], region["center"][1])
+        detected_point = (float(detected_full[0]), float(detected_full[1]))
+        nearest, nearest_distance = nearest_detected_viewport_box(viewport, detected_point)
+        intended_center = intended.get("center", [0, 0])
+        delta = [
+            round(detected_point[0] - float(intended_center[0]), 2),
+            round(detected_point[1] - float(intended_center[1]), 2),
+        ]
+        status = "ok"
+        if nearest is None:
+            status = "unknown"
+        elif nearest.get("label") != intended.get("label") and not point_in_bbox(detected_point, intended.get("bbox")):
+            status = "mismatch"
+
+        detections.append(
+            {
+                "label": label,
+                "status": status,
+                "viewport_label": viewport.get("label"),
+                "tap_number": item_number,
+                "intended_label": intended.get("label"),
+                "intended_center": intended.get("center"),
+                "detected_highlight_center": [round(detected_point[0], 2), round(detected_point[1], 2)],
+                "delta_from_intended": delta,
+                "nearest_label": nearest.get("label") if nearest else None,
+                "nearest_status": nearest.get("status") if nearest else None,
+                "nearest_distance": nearest_distance,
+                "changed_pixels": region["changed_pixels"],
+            }
+        )
+
+    viewport_summaries = [
+        {
+            "label": record.get("label"),
+            "path": record.get("_path"),
+            "tap_count": record.get("tap_count", 0),
+            "seen_skip_count": record.get("seen_skip_count", 0),
+            "row_centers": record.get("row_centers", []),
+            "progress_from_previous": record.get("progress_from_previous"),
+            "skipped_labels": [
+                box.get("label")
+                for box in record.get("boxes", [])
+                if isinstance(box, dict) and box.get("status") == "seen_skip"
+            ],
+        }
+        for record in viewport_records
+    ]
+
+    return {
+        "debug_dir": str(debug_dir),
+        "manifest": str(manifest),
+        "detections": detections,
+        "unresolved": unresolved,
+        "viewport_summaries": viewport_summaries,
+    }
+
+
+def print_detected_tap_analysis(analysis: dict[str, Any]) -> None:
+    detections = analysis["detections"]
+    unresolved = analysis["unresolved"]
+    mismatches = [entry for entry in detections if entry.get("status") == "mismatch"]
+    print(f"Analyzed detected taps: {analysis['manifest']}")
+    print(f"Detected tap highlights: {len(detections)}")
+    print(f"Mismatched highlights: {len(mismatches)}")
+    print(f"Unresolved taps: {len(unresolved)}")
+
+    if detections:
+        print("\nTap detail:")
+        for entry in detections[:80]:
+            print(
+                f"  {entry['label']}: {entry['status']} intended={entry['intended_label']} "
+                f"highlight={entry['detected_highlight_center']} delta={entry['delta_from_intended']} "
+                f"nearest={entry['nearest_label']}({entry['nearest_status']})"
+            )
+
+    skipped_viewports = [
+        entry
+        for entry in analysis["viewport_summaries"]
+        if int(entry.get("seen_skip_count", 0)) > 0
+    ]
+    if skipped_viewports:
+        print("\nViewport skips:")
+        for entry in skipped_viewports[:40]:
+            progress = entry.get("progress_from_previous") or {}
+            scroll = ""
+            if progress.get("median_shift_rows") is not None:
+                scroll = f" scroll_rows={progress['median_shift_rows']}"
+            print(
+                f"  {entry['label']}: tap={entry['tap_count']} seen_skip={entry['seen_skip_count']}"
+                f"{scroll} skipped={entry['skipped_labels']}"
+            )
+
+    if unresolved:
+        print("\nUnresolved examples:")
+        for entry in unresolved[:12]:
+            print(f"  {entry.get('label', '(unknown)')}: {entry.get('reason')}")
+
+
 def calibrate_advance_offset(config: dict[str, Any], completed_index: int, delay_seconds: float | None) -> None:
     pyautogui = require_package("pyautogui")
     actions = preview_advance_actions(config, completed_index)
@@ -3593,6 +5654,22 @@ def equipment_identity_key(parsed: dict[str, Any]) -> str | None:
     )
 
 
+def parsed_duplicate_status(
+    parsed: dict[str, Any],
+    seen_equipment_keys: set[str],
+    config: dict[str, Any],
+) -> tuple[str | None, str]:
+    if not config.get("skip_duplicate_parsed_equipment", True):
+        return None, ""
+
+    identity_key = equipment_identity_key(parsed)
+    if not identity_key:
+        return None, ""
+    if identity_key in seen_equipment_keys:
+        return identity_key, "parsed_equipment"
+    return identity_key, ""
+
+
 def default_reparse_output_path(ocr_path: Path) -> Path:
     if ocr_path.name.endswith("_ocr.txt"):
         return ocr_path.with_name(ocr_path.name[: -len("_ocr.txt")] + "_parsed.json")
@@ -3621,16 +5698,44 @@ def compact_region_parse(parsed: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in parsed.items() if key not in {"ocr_regions"}}
 
 
-def process_one(index: int, config: dict[str, Any], debug_dir: Path) -> EquipmentResult:
+def select_primary_ocr_region(
+    regions: list[dict[str, Any]],
+    preferred_name_or_role: str | None = None,
+) -> dict[str, Any]:
+    if preferred_name_or_role:
+        preferred = str(preferred_name_or_role).lower()
+        for region in regions:
+            if str(region.get("name", "")).lower() == preferred or str(region.get("role", "")).lower() == preferred:
+                return region
+        available = ", ".join(str(region.get("name", "?")) for region in regions)
+        raise AutomationError(f"Could not find OCR region '{preferred_name_or_role}'. Available: {available}")
+
+    for region in regions:
+        if region.get("primary"):
+            return region
+    raise AutomationError("No primary OCR region is configured.")
+
+
+def process_one(
+    index: int,
+    config: dict[str, Any],
+    debug_dir: Path,
+    primary_only: bool = False,
+    primary_region_name: str | None = None,
+) -> EquipmentResult:
     full_image = capture_screenshot(config)
     debug_dir.mkdir(parents=True, exist_ok=True)
-    full_image_path = debug_dir / f"{index:04d}_full.png"
-    full_image.save(full_image_path)
+    full_image_path: Path | None = None
+    if debug_save_full_screenshot(config):
+        full_image_path = debug_dir / f"{index:04d}_full.png"
+        full_image.save(full_image_path)
 
     regions = resolve_ocr_regions(config)
-    primary_region = next(region for region in regions if region.get("primary"))
+    primary_region = select_primary_ocr_region(regions, primary_region_name)
+    if primary_only:
+        regions = [primary_region]
 
-    region_images: dict[str, Path] = {}
+    region_images: dict[str, Path | None] = {}
     region_ocr_paths: dict[str, Path] = {}
     region_parsed: dict[str, dict[str, Any]] = {}
     region_texts: dict[str, str] = {}
@@ -3654,6 +5759,7 @@ def process_one(index: int, config: dict[str, Any], debug_dir: Path) -> Equipmen
             image=processed,
             raw_text=raw_text,
             parsed=parsed,
+            save_image=debug_save_region_images(config),
         )
         region_images[name] = image_path
         region_ocr_paths[name] = ocr_path
@@ -3681,14 +5787,16 @@ def process_one(index: int, config: dict[str, Any], debug_dir: Path) -> Equipmen
     raw_text = region_texts[target_region]
     img_hash = region_hashes[target_region]
 
-    # Keep the legacy debug filenames pointing at the primary/submitted item.
-    save_debug_artifacts(
-        debug_dir=debug_dir,
-        index=index,
-        image=preprocess_for_ocr(crop_image(full_image, primary_region.get("crop")), config),
-        raw_text=raw_text,
-        parsed=parsed,
-    )
+    if debug_save_legacy_primary_copy(config):
+        # Keep the legacy debug filenames pointing at the primary/submitted item.
+        save_debug_artifacts(
+            debug_dir=debug_dir,
+            index=index,
+            image=preprocess_for_ocr(crop_image(full_image, primary_region.get("crop")), config),
+            raw_text=raw_text,
+            parsed=parsed,
+            save_image=debug_save_region_images(config),
+        )
 
     return EquipmentResult(
         index=index,
@@ -3704,6 +5812,115 @@ def process_one(index: int, config: dict[str, Any], debug_dir: Path) -> Equipmen
     )
 
 
+def crop_rect_from_bbox_or_center(image: Any, target: dict[str, Any], config: dict[str, Any]) -> Rect:
+    width, height = image.size
+    bbox = target.get("bbox")
+    margin = config.get("advance", {}).get("card_tier_ocr_bbox_margin_px", 8)
+    if isinstance(bbox, list) and len(bbox) == 4:
+        left = float(bbox[0]) - float(margin)
+        top = float(bbox[1]) - float(margin)
+        right = float(bbox[2]) + float(margin)
+        bottom = float(bbox[3]) + float(margin)
+    else:
+        center = target.get("center")
+        if center is None and "x" in target and "y" in target:
+            center = [target["x"], target["y"]]
+        if not isinstance(center, list) or len(center) != 2:
+            raise AutomationError("Card tier OCR target must include bbox, center, or x/y.")
+        crop_size = config.get("advance", {}).get("card_tier_ocr_crop_size", [190, 170])
+        if not isinstance(crop_size, list) or len(crop_size) != 2:
+            raise AutomationError("advance.card_tier_ocr_crop_size must be [width, height].")
+        half_width = float(crop_size[0]) / 2.0
+        half_height = float(crop_size[1]) / 2.0
+        left = float(center[0]) - half_width
+        top = float(center[1]) - half_height
+        right = float(center[0]) + half_width
+        bottom = float(center[1]) + half_height
+
+    left_i = max(0, int(round(left)))
+    top_i = max(0, int(round(top)))
+    right_i = min(width, int(round(right)))
+    bottom_i = min(height, int(round(bottom)))
+    if right_i <= left_i or bottom_i <= top_i:
+        raise AutomationError(f"Card tier OCR crop is empty: {[left_i, top_i, right_i, bottom_i]}")
+    return (left_i, top_i, right_i - left_i, bottom_i - top_i)
+
+
+def crop_inner_rect(image: Any, rect: Rect | None) -> Any:
+    if rect is None:
+        return image
+    left, top, width, height = rect
+    image_width, image_height = image.size
+    left_i = max(0, int(round(left)))
+    top_i = max(0, int(round(top)))
+    right_i = min(image_width, int(round(left + width)))
+    bottom_i = min(image_height, int(round(top + height)))
+    if right_i <= left_i or bottom_i <= top_i:
+        raise AutomationError(f"Inner OCR crop is empty: {[left_i, top_i, right_i, bottom_i]}")
+    return image.crop((left_i, top_i, right_i, bottom_i))
+
+
+def card_tier_ocr_config(config: dict[str, Any]) -> dict[str, Any]:
+    tier_config = json.loads(json.dumps(config))
+    ocr_config = tier_config.setdefault("ocr", {})
+    advance = tier_config.get("advance", {})
+    ocr_config["psm"] = str(advance.get("card_tier_ocr_psm", 7))
+    ocr_config["scale"] = float(advance.get("card_tier_ocr_scale", 5.0))
+    ocr_config["contrast"] = float(advance.get("card_tier_ocr_contrast", 2.0))
+    ocr_config["threshold"] = advance.get("card_tier_ocr_threshold", ocr_config.get("threshold"))
+    extra_args = str(ocr_config.get("extra_args", "")).strip()
+    whitelist = str(advance.get("card_tier_ocr_whitelist", "TtIilL1234"))
+    whitelist_arg = f"-c tessedit_char_whitelist={whitelist}"
+    ocr_config["extra_args"] = f"{extra_args} {whitelist_arg}".strip()
+    return tier_config
+
+
+def extract_card_tier(
+    image: Any,
+    target: dict[str, Any],
+    config: dict[str, Any],
+    debug_dir: Path | None = None,
+    index: int | None = None,
+    label: str = "card",
+) -> tuple[int | None, str]:
+    if not bool(config.get("advance", {}).get("ocr_card_tier", False)):
+        return None, ""
+
+    rect = crop_rect_from_bbox_or_center(image, target, config)
+    card_image = crop_image(image, rect)
+    inner_crop = parse_rect(config.get("advance", {}).get("card_tier_ocr_inner_crop"), "advance.card_tier_ocr_inner_crop")
+    tier_image = crop_inner_rect(card_image, inner_crop)
+    tier_config = card_tier_ocr_config(config)
+    processed = preprocess_for_ocr(tier_image, tier_config)
+    raw_text = normalize_text(ocr_with_tesseract(processed, tier_config), tier_config)
+    tier = infer_tier_from_text(raw_text)
+
+    if debug_dir is not None and index is not None:
+        safe_label = safe_filename_part(label)
+        save_region_debug_artifacts(
+            debug_dir=debug_dir,
+            index=index,
+            region_name=f"{safe_label}_card_tier",
+            image=processed,
+            raw_text=raw_text,
+            parsed={"tier": tier, "raw_text": raw_text, "crop": list(rect)},
+            save_image=debug_save_region_images(config),
+        )
+
+    return tier, raw_text
+
+
+def apply_tier_override(parsed: dict[str, Any], tier: int | None, source: str) -> None:
+    if tier is None:
+        return
+    previous_tier = parsed.get("tier")
+    parsed["tier"] = tier
+    parsed["tier_source"] = source
+    if previous_tier not in {None, "", tier}:
+        parsed["tier_overrode"] = previous_tier
+    parsed["equipment_name"] = build_equipment_name(parsed)
+
+
 def print_result(result: EquipmentResult) -> None:
     print(f"\n[{result.index}] OCR text ({result.target_region})")
     print("-" * 40)
@@ -3717,12 +5934,719 @@ def print_result(result: EquipmentResult) -> None:
     print(json.dumps(parsed_preview, indent=2, ensure_ascii=False))
     if result.full_image_path:
         print(f"Saved full screenshot: {result.full_image_path}")
-    print(f"Saved image: {result.image_path}")
+    if result.image_path:
+        print(f"Saved image: {result.image_path}")
     print(f"Saved OCR:   {result.ocr_text_path}")
-    if len(result.region_image_paths) > 1:
+    if len(result.region_image_paths) > 1 and any(result.region_image_paths.values()):
         print("Region images:")
         for name, path in result.region_image_paths.items():
-            print(f"  {name}: {path}")
+            if path:
+                print(f"  {name}: {path}")
+
+
+def submit_result_to_configured_website(
+    result: EquipmentResult,
+    config: dict[str, Any],
+    driver: str,
+    page: Any,
+    debug_dir: Path,
+) -> None:
+    try:
+        if driver == "chrome_applescript":
+            submit_to_website_applescript(result.parsed, config)
+        elif page is not None:
+            submit_to_website(page, result.parsed, config)
+    except AutomationError as exc:
+        error_path = debug_dir / f"{result.index:04d}_submit_error.json"
+        error_path.write_text(
+            json.dumps(
+                {
+                    "error": str(exc),
+                    "parsed": result.parsed,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"Submit error debug: {error_path}")
+        raise
+
+
+def record_and_maybe_submit_result(
+    result: EquipmentResult,
+    config: dict[str, Any],
+    driver: str,
+    page: Any,
+    debug_dir: Path,
+    dry_run: bool,
+    seen_equipment_keys: set[str],
+    csv_rows: list[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> tuple[str | None, str, bool]:
+    identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+    if duplicate_reason:
+        print(
+            f"Duplicate parsed equipment detected at item {result.index}; "
+            "skipping website submit."
+        )
+        submitted_or_new = False
+    elif not dry_run:
+        submit_result_to_configured_website(result, config, driver, page, debug_dir)
+        submitted_or_new = True
+        if identity_key:
+            seen_equipment_keys.add(identity_key)
+    else:
+        submitted_or_new = True
+        if identity_key:
+            seen_equipment_keys.add(identity_key)
+
+    csv_rows.append(
+        {
+            **metadata,
+            "index": result.index,
+            "skipped_duplicate": bool(duplicate_reason),
+            "duplicate_reason": duplicate_reason,
+            **result.parsed,
+        }
+    )
+    return identity_key, duplicate_reason, submitted_or_new
+
+
+def run_submit_manual_pages(
+    config: dict[str, Any],
+    debug_dir: Path,
+    csv_log: Path,
+    dry_run: bool,
+    driver: str,
+    page: Any = None,
+    snapshotter: MovementSnapshotter | None = None,
+    page_limit: int | None = None,
+    primary_only: bool = False,
+) -> None:
+    detect_config = detected_items_config(config)
+    max_pages = page_limit if page_limit is not None else int(detect_config.get("max_all_pages", 200))
+    click_delay = float(detect_config.get("manual_page_click_delay_seconds", 2.0))
+    seen_equipment_keys: set[str] = set()
+    csv_rows: list[dict[str, Any]] = []
+    total_processed = 0
+    total_submitted = 0
+    total_duplicates = 0
+    total_tap_retries = 0
+    previous_observed_identity_key: str | None = None
+    previous_observed_image_hash: str | None = None
+    previous_observed_box: dict[str, Any] | None = None
+
+    retry_offsets = configured_tap_retry_offsets(config)
+    max_tap_retries = max(0, int(detect_config.get("tap_retry_attempts", 0)))
+    retry_delay = float(detect_config.get("tap_retry_delay_seconds", 0.15))
+
+    print(
+        "Manual-page submit mode. For each visible page, you choose the first card; "
+        "the script enters that card, then only cards to its right and rows below."
+    )
+    print("After each page finishes, scroll manually and repeat. Type q at a prompt to stop.")
+
+    for page_index in range(max_pages):
+        response = input(
+            f"\nManual page {page_index + 1}: press Enter, then click the first card to enter "
+            f"within {click_delay:g}s. Type q then Enter to finish: "
+        ).strip().lower()
+        if response in {"q", "quit", "done", "stop", "exit"}:
+            break
+
+        before_image = capture_screenshot(config)
+        print(f"Click the first desired card now. Capturing selection in {click_delay:g}s...")
+        if click_delay > 0:
+            time.sleep(click_delay)
+        after_image = capture_screenshot(config)
+
+        boxes = detect_visible_item_boxes(after_image, config)
+        if not boxes:
+            print("No visible equipment item cards detected after your click; stopping.")
+            break
+
+        signed_boxes, row_centers = prepare_manual_detected_viewport(boxes, config)
+        progress = None
+        selected_box = detect_manual_selected_box(before_image, after_image, signed_boxes, config)
+        boxes_to_click = boxes_after_manual_selection(signed_boxes, selected_box)
+        json_path, image_path = write_detected_viewport_debug(
+            config,
+            debug_dir,
+            f"submit_manual_page_{page_index + 1:04d}",
+            after_image,
+            signed_boxes,
+            boxes_to_click,
+            [],
+            row_centers,
+            progress,
+        )
+        selected_label = detected_item_box_grid_label(selected_box)
+        selected_score = selected_box.get("manual_selection_changed_pixels")
+        print(
+            f"Manual start: {selected_label}@({float(selected_box['center'][0]):.0f},"
+            f"{float(selected_box['center'][1]):.0f}) changed_pixels={selected_score}"
+        )
+        print_detected_viewport_summary(
+            config,
+            f"Manual viewport {page_index + 1}",
+            signed_boxes,
+            boxes_to_click,
+            [],
+            row_centers,
+            progress,
+            json_path,
+            image_path,
+        )
+
+        page_submitted = 0
+        page_duplicates = 0
+
+        result = process_one(total_processed, config, debug_dir, primary_only=primary_only)
+        print_result(result)
+        identity_key, duplicate_reason, submitted_or_new = record_and_maybe_submit_result(
+            result,
+            config,
+            driver,
+            page,
+            debug_dir,
+            dry_run,
+            seen_equipment_keys,
+            csv_rows,
+            {
+                "manual_page": page_index + 1,
+                "manual_selected": True,
+                "detected_card": 0,
+                "detected_card_label": selected_label,
+                "detected_card_center": selected_box.get("center"),
+                "tap_retry_discarded": False,
+                "tap_retry_count": 0,
+            },
+        )
+        total_processed += 1
+        if duplicate_reason:
+            page_duplicates += 1
+            total_duplicates += 1
+        elif submitted_or_new:
+            page_submitted += 1
+            total_submitted += 1
+        previous_observed_identity_key = identity_key or equipment_identity_key(result.parsed)
+        previous_observed_image_hash = result.image_hash
+        previous_observed_box = selected_box
+
+        for card_index, box in enumerate(boxes_to_click, start=1):
+            result = None
+            result_index = None
+            identity_key = None
+            duplicate_reason = ""
+            retry_discarded = 0
+
+            for attempt_index in range(max_tap_retries + 1):
+                offset = retry_offsets[min(attempt_index, len(retry_offsets) - 1)]
+                action = detected_item_action_with_offset(config, tuple(box["center"]), offset)
+                retry_note = "" if attempt_index == 0 else f" retry {attempt_index}/{max_tap_retries}"
+                offset_note = "" if offset == (0.0, 0.0) else f" offset=({offset[0]:g},{offset[1]:g})"
+                print(
+                    f"Click manual page {page_index + 1} {detected_item_box_grid_label(box)}{retry_note}{offset_note}: "
+                    f"{describe_advance_action(config, action)}"
+                )
+                run_advance_action_group(
+                    config,
+                    [action],
+                    snapshotter,
+                    f"submit_manual_page_{page_index + 1:04d}_card_{card_index:04d}_try_{attempt_index + 1:02d}",
+                )
+
+                result_index = total_processed
+                result = process_one(result_index, config, debug_dir, primary_only=primary_only)
+                print_result(result)
+                total_processed += 1
+
+                identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+                should_retry = should_retry_unchanged_equipment_tap(
+                    config,
+                    identity_key,
+                    result.image_hash,
+                    previous_observed_identity_key,
+                    previous_observed_image_hash,
+                    box,
+                    previous_observed_box,
+                    attempt_index,
+                    max_tap_retries,
+                )
+                if should_retry:
+                    retry_discarded += 1
+                    total_tap_retries += 1
+                    print(
+                        "Tap verification saw the same equipment details after tapping a different card; "
+                        "retrying this card."
+                    )
+                    csv_rows.append(
+                        {
+                            "index": result_index,
+                            "manual_page": page_index + 1,
+                            "manual_selected": False,
+                            "detected_card": card_index,
+                            "detected_card_label": detected_item_box_grid_label(box),
+                            "detected_card_center": box.get("center"),
+                            "tap_retry_discarded": True,
+                            "tap_retry_attempt": attempt_index + 1,
+                            "retry_reason": "unchanged_equipment_after_tap",
+                            "skipped_duplicate": bool(duplicate_reason),
+                            "duplicate_reason": duplicate_reason,
+                            **result.parsed,
+                        }
+                    )
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
+                break
+
+            if result is None or result_index is None:
+                continue
+
+            identity_key, duplicate_reason, submitted_or_new = record_and_maybe_submit_result(
+                result,
+                config,
+                driver,
+                page,
+                debug_dir,
+                dry_run,
+                seen_equipment_keys,
+                csv_rows,
+                {
+                    "manual_page": page_index + 1,
+                    "manual_selected": False,
+                    "detected_card": card_index,
+                    "detected_card_label": detected_item_box_grid_label(box),
+                    "detected_card_center": box.get("center"),
+                    "tap_retry_discarded": False,
+                    "tap_retry_count": retry_discarded,
+                },
+            )
+            if duplicate_reason:
+                page_duplicates += 1
+                total_duplicates += 1
+            elif submitted_or_new:
+                page_submitted += 1
+                total_submitted += 1
+
+            previous_observed_identity_key = identity_key or equipment_identity_key(result.parsed)
+            previous_observed_image_hash = result.image_hash
+            previous_observed_box = box
+
+        print(
+            f"Manual page {page_index + 1} summary: submitted/new={page_submitted}, "
+            f"duplicates={page_duplicates}, processed={1 + len(boxes_to_click)}"
+        )
+    else:
+        print(f"Stopped after manual page limit ({max_pages}).")
+
+    write_csv_log(csv_log, csv_rows)
+    print(f"\nParsed CSV log: {csv_log}")
+    print(
+        f"Total processed={total_processed}, submitted/new={total_submitted}, "
+        f"duplicates={total_duplicates}, tap_retries={total_tap_retries}"
+    )
+
+
+def run_submit_equipped_slots(
+    config: dict[str, Any],
+    debug_dir: Path,
+    csv_log: Path,
+    dry_run: bool,
+    driver: str,
+    page: Any = None,
+    snapshotter: MovementSnapshotter | None = None,
+    limit: int | None = None,
+    manual_first: bool | None = None,
+) -> None:
+    slots = equipped_slot_positions(config)
+    if not slots:
+        raise AutomationError("No equipped slots configured in advance.equipped_slot_positions.")
+    if limit is not None:
+        slots = slots[:limit]
+
+    primary_region_name = str(config.get("advance", {}).get("equipped_slot_ocr_region", "equipped"))
+    if manual_first is None:
+        manual_first = bool(config.get("advance", {}).get("equipped_slot_manual_first", True))
+    seen_equipment_keys: set[str] = set()
+    csv_rows: list[dict[str, Any]] = []
+    total_submitted = 0
+    total_duplicates = 0
+    offset = (0.0, 0.0)
+    start_index = 0
+
+    print(
+        f"Submit equipped slots: {len(slots)} configured slot(s); "
+        f"OCR primary region='{primary_region_name}'."
+    )
+    if manual_first:
+        first_slot = slots[0]
+        delay = equipped_slot_manual_click_delay(config)
+        response = input(
+            f"\nEquipped slots: press Enter, then click the top-left equipped item "
+            f"({first_slot['label']}) within {delay:g}s. Type q then Enter to stop: "
+        ).strip().lower()
+        if response in {"q", "quit", "done", "stop", "exit"}:
+            write_csv_log(csv_log, csv_rows)
+            print(f"\nParsed CSV log: {csv_log}")
+            return
+
+        before_image = capture_screenshot(config)
+        print(f"Click the top-left equipped item now. Capturing selection in {delay:g}s...")
+        if delay > 0:
+            time.sleep(delay)
+        after_image = capture_screenshot(config)
+        offset, detection = estimate_equipped_slot_offset_from_manual_click(before_image, after_image, first_slot, config)
+        if detection is None:
+            raise AutomationError(
+                "Could not calibrate the top-left equipped slot. "
+                "Run again with --save-debug-images and make sure you click the top-left equipped card."
+            )
+        elif detection.get("offset_rejected"):
+            raise AutomationError(
+                "Top-left equipped-slot calibration looked too large, so the run stopped before tapping other slots. "
+                f"Rejected offset={detection.get('rejected_offset')}, method={detection.get('method')}, "
+                f"center={detection.get('center')}, detected_cards={detection.get('detected_cards')}. "
+                "Run with --save-debug-images if we need to tune advance.equipped_slot_positions."
+            )
+        else:
+            detail = (
+                f"detected_cards={detection.get('detected_cards')}"
+                if detection.get("method") == "equipped_slot_box_detection"
+                else f"changed_pixels={detection.get('changed_pixels')}"
+            )
+            print(
+                f"Top-left click offset: ({offset[0]:.1f}, {offset[1]:.1f}) "
+                f"from {detection.get('method')} {detail} center={detection.get('center')}"
+            )
+
+        result = process_one(
+            0,
+            config,
+            debug_dir,
+            primary_only=True,
+            primary_region_name=primary_region_name,
+        )
+        print_result(result)
+        identity_key, duplicate_reason, submitted_or_new = record_and_maybe_submit_result(
+            result,
+            config,
+            driver,
+            page,
+            debug_dir,
+            dry_run,
+            seen_equipment_keys,
+            csv_rows,
+            {
+                "equipped_slot_index": 1,
+                "equipped_slot_label": first_slot["label"],
+                "equipped_slot_center": [first_slot["x"], first_slot["y"]],
+                "manual_first_equipped_slot": True,
+                "tap_offset": [round(offset[0], 1), round(offset[1], 1)],
+                "detected_click_center": detection.get("center") if detection else None,
+            },
+        )
+        if duplicate_reason:
+            total_duplicates += 1
+        elif submitted_or_new:
+            total_submitted += 1
+        if identity_key and not duplicate_reason:
+            seen_equipment_keys.add(identity_key)
+        start_index = 1
+
+    for index, slot in enumerate(slots[start_index:], start=start_index):
+        tap_slot = apply_equipped_slot_offset(slot, offset)
+        action = equipped_slot_action(config, tap_slot)
+        print(
+            f"Click equipped slot {index + 1}/{len(slots)} {slot['label']}: "
+            f"{describe_advance_action(config, action)}"
+        )
+        run_advance_action_group(
+            config,
+            [action],
+            snapshotter,
+            f"submit_equipped_slot_{index + 1:04d}_{safe_filename_part(str(slot['label']))}",
+        )
+
+        result = process_one(
+            index,
+            config,
+            debug_dir,
+            primary_only=True,
+            primary_region_name=primary_region_name,
+        )
+        print_result(result)
+        identity_key, duplicate_reason, submitted_or_new = record_and_maybe_submit_result(
+            result,
+            config,
+            driver,
+            page,
+            debug_dir,
+            dry_run,
+            seen_equipment_keys,
+            csv_rows,
+            {
+                "equipped_slot_index": index + 1,
+                "equipped_slot_label": slot["label"],
+                "equipped_slot_center": [slot["x"], slot["y"]],
+                "equipped_slot_tap_center": [round(float(tap_slot["x"]), 1), round(float(tap_slot["y"]), 1)],
+                "tap_offset": [round(offset[0], 1), round(offset[1], 1)],
+                "manual_first_equipped_slot": False,
+            },
+        )
+        if duplicate_reason:
+            total_duplicates += 1
+        elif submitted_or_new:
+            total_submitted += 1
+        if identity_key and not duplicate_reason:
+            seen_equipment_keys.add(identity_key)
+
+    write_csv_log(csv_log, csv_rows)
+    print(f"\nParsed CSV log: {csv_log}")
+    print(
+        f"Equipped slot summary: processed={len(slots)}, "
+        f"submitted/new={total_submitted}, duplicates={total_duplicates}"
+    )
+
+
+def run_submit_detected_all(
+    config: dict[str, Any],
+    debug_dir: Path,
+    csv_log: Path,
+    dry_run: bool,
+    driver: str,
+    page: Any = None,
+    snapshotter: MovementSnapshotter | None = None,
+    primary_only: bool = False,
+) -> None:
+    detect_config = detected_items_config(config)
+    max_all_pages = int(detect_config.get("max_all_pages", 200))
+    max_duplicate_pages = int(detect_config.get("max_duplicate_pages_before_stop", 3))
+    seen_equipment_keys: set[str] = set()
+    seen_card_signatures: list[dict[str, Any]] = []
+    previous_signed_boxes: list[dict[str, Any]] | None = None
+    snap_target_rows: list[float] | None = None
+    csv_rows: list[dict[str, Any]] = []
+    total_clicked = 0
+    total_submitted = 0
+    total_duplicates = 0
+    total_visual_skips = 0
+    total_tap_retries = 0
+    previous_observed_identity_key: str | None = None
+    previous_observed_image_hash: str | None = None
+    previous_observed_box: dict[str, Any] | None = None
+    duplicate_pages = 0
+
+    print(f"Submit detected all-items; max pages: {max_all_pages}")
+    for page_index in range(max_all_pages):
+        image = capture_screenshot(config)
+        boxes = detect_visible_item_boxes(image, config)
+        if not boxes:
+            print("No visible equipment item cards detected; stopping.")
+            break
+
+        skip_row_limit = None
+        if page_index > 0:
+            skip_rows = int(detect_config.get("skip_seen_rows_after_crawl_scroll", 1))
+            if skip_rows >= 0:
+                skip_row_limit = skip_rows
+        signed_boxes, boxes_to_click, skipped_boxes, row_centers, progress = prepare_detected_viewport(
+            image,
+            boxes,
+            seen_card_signatures,
+            config,
+            skip_row_limit,
+            previous_signed_boxes,
+        )
+        json_path, image_path = write_detected_viewport_debug(
+            config,
+            debug_dir,
+            f"submit_detected_all_{page_index + 1:04d}",
+            image,
+            signed_boxes,
+            boxes_to_click,
+            skipped_boxes,
+            row_centers,
+            progress,
+        )
+        print_detected_viewport_summary(
+            config,
+            f"Submit viewport {page_index + 1}",
+            signed_boxes,
+            boxes_to_click,
+            skipped_boxes,
+            row_centers,
+            progress,
+            json_path,
+            image_path,
+        )
+        if snap_target_rows is None and row_centers:
+            snap_target_rows = row_centers
+            print(f"Submit row snap target centers: {[round(value, 1) for value in snap_target_rows]}")
+        page_submitted = 0
+        page_duplicates = 0
+        page_visual_skips = len(skipped_boxes)
+        total_visual_skips += page_visual_skips
+
+        retry_offsets = configured_tap_retry_offsets(config)
+        max_tap_retries = max(0, int(detect_config.get("tap_retry_attempts", 0)))
+        retry_delay = float(detect_config.get("tap_retry_delay_seconds", 0.15))
+
+        for card_index, box in enumerate(boxes_to_click, start=1):
+            result: EquipmentResult | None = None
+            result_index: int | None = None
+            identity_key: str | None = None
+            duplicate_reason = ""
+            retry_discarded = 0
+
+            for attempt_index in range(max_tap_retries + 1):
+                offset = retry_offsets[min(attempt_index, len(retry_offsets) - 1)]
+                action = detected_item_action_with_offset(config, tuple(box["center"]), offset)
+                retry_note = "" if attempt_index == 0 else f" retry {attempt_index}/{max_tap_retries}"
+                offset_note = "" if offset == (0.0, 0.0) else f" offset=({offset[0]:g},{offset[1]:g})"
+                print(
+                    f"Click submit viewport {page_index + 1} {detected_item_box_grid_label(box)}{retry_note}{offset_note}: "
+                    f"{describe_advance_action(config, action)}"
+                )
+                run_advance_action_group(
+                    config,
+                    [action],
+                    snapshotter,
+                    f"submit_detected_page_{page_index + 1:04d}_card_{card_index:04d}_try_{attempt_index + 1:02d}",
+                )
+                signature = box.get("signature")
+                if isinstance(signature, dict):
+                    seen_card_signatures.append(signature)
+
+                result_index = total_clicked
+                result = process_one(result_index, config, debug_dir, primary_only=primary_only)
+                print_result(result)
+                total_clicked += 1
+
+                identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+                should_retry = should_retry_unchanged_equipment_tap(
+                    config,
+                    identity_key,
+                    result.image_hash,
+                    previous_observed_identity_key,
+                    previous_observed_image_hash,
+                    box,
+                    previous_observed_box,
+                    attempt_index,
+                    max_tap_retries,
+                )
+                if should_retry:
+                    retry_discarded += 1
+                    total_tap_retries += 1
+                    print(
+                        "Tap verification saw the same equipment details after tapping a different card; "
+                        "retrying this card."
+                    )
+                    csv_rows.append(
+                        {
+                            "index": result_index,
+                            "detected_page": page_index + 1,
+                            "detected_card": card_index,
+                            "detected_card_label": detected_item_box_grid_label(box),
+                            "detected_card_center": box.get("center"),
+                            "tap_retry_discarded": True,
+                            "tap_retry_attempt": attempt_index + 1,
+                            "retry_reason": "unchanged_equipment_after_tap",
+                            "skipped_duplicate": bool(duplicate_reason),
+                            "duplicate_reason": duplicate_reason,
+                            **result.parsed,
+                        }
+                    )
+                    if retry_delay > 0:
+                        time.sleep(retry_delay)
+                    continue
+                break
+
+            if result is None or result_index is None:
+                continue
+
+            if duplicate_reason:
+                page_duplicates += 1
+                total_duplicates += 1
+                print(
+                    f"Duplicate parsed equipment detected at clicked item {result_index}; "
+                    "skipping website submit."
+                )
+            elif not dry_run:
+                submit_result_to_configured_website(result, config, driver, page, debug_dir)
+                page_submitted += 1
+                total_submitted += 1
+                if identity_key:
+                    seen_equipment_keys.add(identity_key)
+            else:
+                page_submitted += 1
+                total_submitted += 1
+                if identity_key:
+                    seen_equipment_keys.add(identity_key)
+
+            previous_observed_identity_key = identity_key or equipment_identity_key(result.parsed)
+            previous_observed_image_hash = result.image_hash
+            previous_observed_box = box
+
+            csv_rows.append(
+                {
+                    "index": result_index,
+                    "detected_page": page_index + 1,
+                    "detected_card": card_index,
+                    "detected_card_label": detected_item_box_grid_label(box),
+                    "detected_card_center": box.get("center"),
+                    "tap_retry_discarded": False,
+                    "tap_retry_count": retry_discarded,
+                    "skipped_duplicate": bool(duplicate_reason),
+                    "duplicate_reason": duplicate_reason,
+                    **result.parsed,
+                }
+            )
+
+        print(
+            f"Page {page_index + 1} summary: submitted/new={page_submitted}, "
+            f"duplicates={page_duplicates}, visual_skips={page_visual_skips}"
+        )
+        if page_submitted == 0 and (page_duplicates > 0 or page_visual_skips > 0 or not boxes_to_click):
+            duplicate_pages += 1
+        else:
+            duplicate_pages = 0
+
+        if duplicate_pages >= max_duplicate_pages:
+            print(
+                f"Stopping after {duplicate_pages} consecutive duplicate-only page(s). "
+                f"Total clicked={total_clicked}, submitted/new={total_submitted}, duplicates={total_duplicates}."
+            )
+            break
+
+        previous_signed_boxes = signed_boxes
+        advanced = advance_after_detected_viewport(
+            config,
+            "all",
+            image,
+            previous_signed_boxes,
+            snapshotter,
+            f"submit_detected_page_{page_index + 1:04d}",
+            snap_target_rows,
+        )
+        if not advanced:
+            print("Stopping submit crawl because verified scroll did not reach the next viewport.")
+            break
+    else:
+        raise AutomationError(
+            f"Stopped after advance.detect_items.max_all_pages={max_all_pages}. "
+            "Increase that value if the inventory is larger."
+        )
+
+    write_csv_log(csv_log, csv_rows)
+    print(f"\nParsed CSV log: {csv_log}")
+    print(
+        f"Total clicked={total_clicked}, submitted/new={total_submitted}, "
+        f"duplicates={total_duplicates}, visual_skips={total_visual_skips}, tap_retries={total_tap_retries}"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3736,6 +6660,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Submit to the website but do not click/scroll to the next equipment item.",
     )
     parser.add_argument("--debug-dir", type=Path, help="Where screenshots/OCR logs should be written.")
+    parser.add_argument(
+        "--save-debug-images",
+        action="store_true",
+        help="Write full/cropped PNG debug images even when the config disables them.",
+    )
     parser.add_argument("--csv-log", type=Path, help="Optional CSV path for parsed results.")
     parser.add_argument(
         "--reparse-ocr",
@@ -3787,6 +6716,65 @@ def main(argv: list[str] | None = None) -> int:
         help="Detect and tap visible item cards, scrolling until no unseen cards remain.",
     )
     parser.add_argument(
+        "--submit-detected-all",
+        action="store_true",
+        help="Click detected item cards, OCR/submit new parsed equipment, and scroll until duplicates indicate the end.",
+    )
+    parser.add_argument(
+        "--submit-gear-list",
+        dest="submit_gear_list",
+        action="store_true",
+        help="Manually choose the first card on each visible page, then OCR/submit that card and later cards only.",
+    )
+    parser.add_argument(
+        "--submit-manual-pages",
+        dest="submit_gear_list",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--submit-equipped-slots",
+        action="store_true",
+        help="Tap configured equipped-slot cards on the character screen and submit the equipped/left OCR region.",
+    )
+    parser.add_argument(
+        "--unequip-website",
+        action="store_true",
+        help="On MIRPG Optimizer, visit each equipment category and click Unequip on the left/equipped compare item.",
+    )
+    parser.add_argument(
+        "--dismantle-website",
+        action="store_true",
+        help="On MIRPG Optimizer, visit each equipment category, select every Manage Equipment item, and click Dismantle.",
+    )
+    parser.add_argument(
+        "--equipped-slot-limit",
+        type=int,
+        default=None,
+        help="Only process the first N configured equipped slots.",
+    )
+    parser.add_argument(
+        "--no-equipped-manual-first",
+        action="store_true",
+        help="Do not prompt for a manual top-left equipped-slot click before tapping remaining equipped slots.",
+    )
+    parser.add_argument(
+        "--manual-page-limit",
+        type=int,
+        default=None,
+        help="Safety limit for --submit-gear-list prompts. Defaults to advance.detect_items.max_all_pages.",
+    )
+    parser.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="OCR only the primary/candidate region and skip equipped/reference regions for non-manual runs.",
+    )
+    parser.add_argument(
+        "--include-reference-regions",
+        action="store_true",
+        help="With --submit-gear-list, also OCR equipped/reference regions for debugging.",
+    )
+    parser.add_argument(
         "--movement-snapshots",
         action="store_true",
         help="Save ADB/screen screenshots during movement tests, including before-click and after-click frames.",
@@ -3796,6 +6784,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="PATH",
         help="Analyze a movement snapshot directory or manifest and suggest corrected click positions.",
+    )
+    parser.add_argument(
+        "--analyze-detected-taps",
+        type=Path,
+        metavar="PATH",
+        help="Analyze detected-card viewport JSON plus movement snapshots to verify tap centers.",
     )
     parser.add_argument(
         "--mouse-position",
@@ -3825,11 +6819,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_json(args.config.expanduser())
+    if args.save_debug_images:
+        debug_config = config.setdefault("debug_artifacts", {})
+        if not isinstance(debug_config, dict):
+            debug_config = {}
+            config["debug_artifacts"] = debug_config
+        debug_config["save_full_screenshot"] = True
+        debug_config["save_region_images"] = True
+        debug_config["save_legacy_primary_copy"] = True
     debug_dir = args.debug_dir or Path(config.get("debug_dir", f"equipment_ocr_debug/{now_stamp()}"))
     csv_log = args.csv_log or (debug_dir / "parsed_results.csv")
 
     if args.limit < 1:
         raise AutomationError("--limit must be at least 1.")
+    if args.equipped_slot_limit is not None and args.equipped_slot_limit < 1:
+        raise AutomationError("--equipped-slot-limit must be at least 1.")
+    if args.manual_page_limit is not None and args.manual_page_limit < 1:
+        raise AutomationError("--manual-page-limit must be at least 1.")
+    if args.include_reference_regions and not args.submit_gear_list:
+        raise AutomationError("--include-reference-regions is only used with --submit-gear-list.")
+    if args.include_reference_regions and args.primary_only:
+        raise AutomationError("Use either --primary-only or --include-reference-regions, not both.")
 
     if args.mouse_position is not None:
         print_mouse_position(args.mouse_position)
@@ -3838,6 +6848,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.analyze_movement_snapshots is not None:
         analysis = analyze_movement_snapshots(args.analyze_movement_snapshots, config)
         print_movement_snapshot_analysis(analysis)
+        return 0
+
+    if args.analyze_detected_taps is not None:
+        analysis = analyze_detected_taps(args.analyze_detected_taps, config)
+        print_detected_tap_analysis(analysis)
         return 0
 
     if args.calibrate_advance is not None:
@@ -3887,6 +6902,7 @@ def main(argv: list[str] | None = None) -> int:
                 snapshotter,
                 args.calibration_delay,
                 not args.no_runtime_calibration,
+                debug_dir,
             )
         finally:
             finish_movement_snapshotter(snapshotter)
@@ -3901,9 +6917,156 @@ def main(argv: list[str] | None = None) -> int:
                 snapshotter,
                 args.calibration_delay,
                 not args.no_runtime_calibration,
+                debug_dir,
             )
         finally:
             finish_movement_snapshotter(snapshotter)
+        return 0
+
+    if args.unequip_website:
+        if args.dry_run:
+            slots = mirpg_unequip_slots(config.get("website", {}))
+            print("Dry run: would click Unequip on the left/equipped compare item for slots:")
+            print(", ".join(slots))
+            return 0
+
+        driver = website_driver(config)
+        pw = browser = page = None
+        close_browser = True
+        try:
+            if driver == "chrome_applescript":
+                prepare_chrome_applescript(config)
+            elif driver == "playwright":
+                pw, browser, page, close_browser = load_playwright(config)
+            else:
+                raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+            run_mirpg_unequip_all_website(config, driver, page)
+        finally:
+            if browser is not None and close_browser:
+                browser.close()
+            if pw is not None:
+                pw.stop()
+        return 0
+
+    if args.dismantle_website:
+        if args.dry_run:
+            slots = mirpg_dismantle_slots(config.get("website", {}))
+            print("Dry run: would click every Manage Equipment item and then Dismantle for slots:")
+            print(", ".join(slots))
+            return 0
+
+        driver = website_driver(config)
+        pw = browser = page = None
+        close_browser = True
+        try:
+            if driver == "chrome_applescript":
+                prepare_chrome_applescript(config)
+            elif driver == "playwright":
+                pw, browser, page, close_browser = load_playwright(config)
+            else:
+                raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+            run_mirpg_dismantle_all_website(config, driver, page)
+        finally:
+            if browser is not None and close_browser:
+                browser.close()
+            if pw is not None:
+                pw.stop()
+        return 0
+
+    if args.submit_detected_all:
+        driver = website_driver(config)
+        pw = browser = page = None
+        close_browser = True
+        if not args.dry_run:
+            if driver == "chrome_applescript":
+                prepare_chrome_applescript(config)
+            elif driver == "playwright":
+                pw, browser, page, close_browser = load_playwright(config)
+            else:
+                raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
+        try:
+            run_submit_detected_all(
+                config,
+                debug_dir,
+                csv_log,
+                args.dry_run,
+                driver,
+                page,
+                snapshotter,
+                args.primary_only,
+            )
+        finally:
+            finish_movement_snapshotter(snapshotter)
+            if browser is not None and close_browser:
+                browser.close()
+            if pw is not None:
+                pw.stop()
+        return 0
+
+    if args.submit_gear_list:
+        driver = website_driver(config)
+        pw = browser = page = None
+        close_browser = True
+        if not args.dry_run:
+            if driver == "chrome_applescript":
+                prepare_chrome_applescript(config)
+            elif driver == "playwright":
+                pw, browser, page, close_browser = load_playwright(config)
+            else:
+                raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
+        try:
+            manual_primary_only = not args.include_reference_regions
+            run_submit_manual_pages(
+                config,
+                debug_dir,
+                csv_log,
+                args.dry_run,
+                driver,
+                page,
+                snapshotter,
+                args.manual_page_limit,
+                manual_primary_only,
+            )
+        finally:
+            finish_movement_snapshotter(snapshotter)
+            if browser is not None and close_browser:
+                browser.close()
+            if pw is not None:
+                pw.stop()
+        return 0
+
+    if args.submit_equipped_slots:
+        driver = website_driver(config)
+        pw = browser = page = None
+        close_browser = True
+        if not args.dry_run:
+            if driver == "chrome_applescript":
+                prepare_chrome_applescript(config)
+            elif driver == "playwright":
+                pw, browser, page, close_browser = load_playwright(config)
+            else:
+                raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
+        try:
+            run_submit_equipped_slots(
+                config,
+                debug_dir,
+                csv_log,
+                args.dry_run,
+                driver,
+                page,
+                snapshotter,
+                args.equipped_slot_limit,
+                not args.no_equipped_manual_first,
+            )
+        finally:
+            finish_movement_snapshotter(snapshotter)
+            if browser is not None and close_browser:
+                browser.close()
+            if pw is not None:
+                pw.stop()
         return 0
 
     if args.advance_only is not None:
@@ -3983,7 +7146,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         for index in range(args.limit):
-            result = process_one(index, config, debug_dir)
+            result = process_one(index, config, debug_dir, primary_only=args.primary_only)
             print_result(result)
 
             duplicate_reason = ""
@@ -3993,16 +7156,12 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 seen_hashes.add(result.image_hash)
 
-            identity_key = equipment_identity_key(result.parsed)
-            if config.get("skip_duplicate_parsed_equipment", True) and identity_key:
-                if identity_key in seen_equipment_keys:
-                    duplicate_reason = "parsed_equipment"
-                    print(
-                        f"Duplicate parsed equipment detected at item {index}; "
-                        "skipping website submit and advancing."
-                    )
-                else:
-                    seen_equipment_keys.add(identity_key)
+            identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+            if duplicate_reason:
+                print(
+                    f"Duplicate parsed equipment detected at item {index}; "
+                    "skipping website submit and advancing."
+                )
 
             csv_rows.append(
                 {
@@ -4037,6 +7196,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     print(f"Submit error debug: {error_path}")
                     raise
+                if identity_key:
+                    seen_equipment_keys.add(identity_key)
+            elif identity_key:
+                seen_equipment_keys.add(identity_key)
 
             if index < args.limit - 1 and not args.dry_run and not args.no_advance:
                 advance_to_next_equipment(config, index)

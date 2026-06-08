@@ -1,5 +1,10 @@
 {
   "debug_dir": "equipment_ocr_debug/latest",
+  "debug_artifacts": {
+    "save_full_screenshot": false,
+    "save_region_images": false,
+    "save_legacy_primary_copy": false
+  },
   "stop_on_duplicate_image": false,
   "skip_duplicate_parsed_equipment": true,
   "capture": {
@@ -8,14 +13,14 @@
     "connect": "127.0.0.1:5555",
     "serial": "127.0.0.1:5555",
     "timeout_seconds": 20,
-    "crop": [1185, 160, 700, 1180],
+    "crop": [1185, 230, 700, 1000],
     "regions": [
       {
         "name": "candidate",
         "role": "primary",
         "description": "Right/new equipment item in the comparison popover. This is the item submitted to the analyzer.",
         "primary": true,
-        "crop": [1185, 160, 700, 1180]
+        "crop": [1185, 230, 700, 1000]
       },
       {
         "name": "equipped",
@@ -23,6 +28,12 @@
         "description": "Left/currently equipped item in the comparison popover. This is saved for reference, not submitted by default.",
         "attach_as": "equipped_item",
         "crop": [485, 160, 705, 1090]
+      },
+      {
+        "name": "equipped_slot_detail",
+        "role": "equipped_slot_detail",
+        "description": "Opened equipped-slot detail popover from the character/equipment screen.",
+        "crop": [1125, 160, 720, 1180]
       }
     ]
   },
@@ -68,9 +79,7 @@
     "keep_lines": true,
     "keep_stat_rows": true,
     "default_tier": null,
-    "default_tier_by_slot": {
-      "Shoes": 4
-    },
+    "default_tier_by_slot": {},
     "stat_aliases": {
       "attack": ["\\bAttack\\b", "\\bAtk\\b", "^\\W*ack\\b"],
       "hp": ["\\bMax\\s*HP\\b", "\\bHP\\b", "^\\W*x\\s+HP\\b"],
@@ -106,7 +115,7 @@
       },
       {
         "name": "tier",
-        "regex": "\\b(?:Tier|T)\\s*[:.+-]?\\s*(?P<value>\\d+)\\b",
+        "regex": "(?:^|[^A-Za-z0-9])(?:Tier|T)\\s*[:.+-]?\\s*(?P<value>[1-4])\\b",
         "type": "int",
         "default": null
       },
@@ -207,6 +216,8 @@
     "manual_login": true,
     "user_data_dir": null,
     "applescript_timeout_seconds": 20,
+    "unequip_timeout_seconds": 45,
+    "dismantle_timeout_seconds": 300,
     "applescript_poll_interval_seconds": 0.25,
     "viewport": {
       "width": 1440,
@@ -217,6 +228,49 @@
     "select_slot_tab": true,
     "top_level_slot_button_selector": "button",
     "top_level_slot_max_y": 520,
+    "require_equipment_slot_for_submit": true,
+    "require_equipment_tier_for_submit": false,
+    "unequip_slots": [
+      "Hat",
+      "Top",
+      "Bottom",
+      "Gloves",
+      "Ring",
+      "Eye",
+      "Earring",
+      "Cape",
+      "Shoulder",
+      "Belt",
+      "Shoes",
+      "Necklace",
+      "Face"
+    ],
+    "dismantle_slots": [
+      "Hat",
+      "Top",
+      "Bottom",
+      "Gloves",
+      "Ring",
+      "Eye",
+      "Earring",
+      "Cape",
+      "Shoulder",
+      "Belt",
+      "Shoes",
+      "Necklace",
+      "Face"
+    ],
+    "wait_after_slot_change_seconds": 0.35,
+    "wait_after_unequip_seconds": 0.45,
+    "wait_after_manage_filter_seconds": 0.25,
+    "wait_after_manage_item_click_seconds": 0.25,
+    "wait_after_dismantle_seconds": 0.45,
+    "max_dismantle_per_slot": 300,
+    "require_unequip_button": false,
+    "require_dismantle_button": true,
+    "require_dismantle_progress": true,
+    "click_manage_slot_filter": true,
+    "auto_confirm_dismantle": true,
     "use_current_editor": false,
     "reuse_empty_sub_option_row": true,
     "skip_known_unsupported_effects": true,
@@ -260,13 +314,35 @@
       "three_point_calibration": true,
       "calibration_uniform_scale": false,
       "skip_seen_cards": true,
-      "skip_seen_rows_after_scroll": 2,
-      "skip_seen_rows_after_crawl_scroll": 1,
+      "skip_seen_rows_after_scroll": -1,
+      "skip_seen_rows_after_crawl_scroll": -1,
       "skip_seen_min_matches_per_row": 2,
       "log_detected_items": false,
+      "page_diagnostics": true,
+      "page_diagnostics_images": false,
+      "min_crawl_scroll_rows": 3.5,
+      "scroll_progress_min_matches": 2,
+      "all_items_stop_scroll_rows_threshold": 0.5,
+      "all_items_stop_min_matched_cards": 4,
+      "all_items_scroll_strategy": "verified_row_step",
+      "verified_scroll_target_rows": 4.0,
+      "verified_scroll_max_attempts": 5,
+      "verified_scroll_min_matches": 2,
+      "viewport_shift_resize_width": 160,
+      "viewport_shift_search_step_px": 4,
+      "viewport_shift_max_px": 900,
+      "viewport_shift_min_overlap_ratio": 0.45,
+      "manual_page_click_delay_seconds": 0.75,
+      "manual_selection_diff_threshold": 18,
+      "manual_selection_min_changed_pixels": 35,
+      "verify_tap_changed_equipment": true,
+      "tap_retry_attempts": 2,
+      "tap_retry_delay_seconds": 0.15,
+      "tap_retry_offsets": [[0, 0], [0, -12], [0, 12], [-12, 0], [12, 0]],
       "min_new_cards_after_scroll": 1,
       "max_extra_scrolls_per_page": 3,
       "max_all_pages": 200,
+      "max_duplicate_pages_before_stop": 3,
       "signature_inset_px": 12,
       "signature_resize": [32, 32],
       "signature_hamming_threshold": 55,
@@ -284,11 +360,34 @@
       "row_snap_anchor": [2205, 740],
       "region": [1900, 240, 585, 1000],
       "max_items_per_page": 15,
-      "min_card_width": 120,
+      "min_card_width": 90,
       "max_card_width": 230,
-      "min_card_height": 120,
+      "min_card_height": 90,
       "max_card_height": 230,
       "min_component_pixels": 2500,
+      "dark_green_threshold": {
+        "min_g": 75,
+        "max_r": 90,
+        "max_b": 110,
+        "min_g_over_r": 20,
+        "min_g_over_b": 5
+      },
+      "dark_orange_threshold": {
+        "min_r": 70,
+        "min_g": 45,
+        "max_b": 90,
+        "min_r_over_g": 8,
+        "min_g_over_b": 5
+      },
+      "colored_card_threshold": {
+        "enabled": true,
+        "max_value": 245,
+        "min_saturation": 18,
+        "dark_max_value": 130,
+        "dark_min_saturation": 8,
+        "neutral_tolerance": 12,
+        "neutral_min_value": 145
+      },
       "min_center_distance": 45,
       "page_scroll_actions": [
         {
@@ -311,27 +410,74 @@
         {
           "type": "adb_swipe",
           "from_x": 2205,
-          "from_y": 1010,
+          "from_y": 1110,
           "to_x": 2205,
-          "to_y": 640,
-          "duration_ms": 850,
+          "to_y": 350,
+          "duration_ms": 1400,
+          "hold_seconds_before": 0.12,
+          "pause_before_release_seconds": 0.25,
+          "steps": 12
+        },
+        {
+          "type": "wait",
+          "seconds": 0.3
+        }
+      ],
+      "verified_scroll_actions": [
+        {
+          "type": "adb_swipe",
+          "from_x": 2205,
+          "from_y": 1040,
+          "to_x": 2205,
+          "to_y": 820,
+          "duration_ms": 700,
           "hold_seconds_before": 0.08,
-          "pause_before_release_seconds": 0.12,
+          "pause_before_release_seconds": 0.1,
           "steps": 8
         },
         {
           "type": "wait",
-          "seconds": 0.25
+          "seconds": 0.2
         }
       ]
     },
-    "wait_after_advance_seconds": 0.2,
+    "wait_after_advance_seconds": 0.1,
     "adb_retries": 3,
     "adb_retry_delay_seconds": 0.8,
     "adb_disconnect_before_reconnect": true,
     "adb_reconnect_delay_seconds": 0.5,
     "adb_restart_server_on_retry": true,
     "adb_restart_server_after_retry": 2,
+    "ocr_card_tier": false,
+    "card_tier_ocr_crop_size": [190, 170],
+    "card_tier_ocr_bbox_margin_px": 8,
+    "equipped_slot_ocr_region": "equipped_slot_detail",
+    "equipped_slot_manual_first": true,
+    "equipped_slot_manual_click_delay_seconds": 0.75,
+    "equipped_slot_manual_max_offset_px": 120,
+    "equipped_slot_detection": {
+      "region": [420, 160, 760, 1120],
+      "max_items_per_page": 12,
+      "min_card_width": 90,
+      "max_card_width": 230,
+      "min_card_height": 90,
+      "max_card_height": 230,
+      "min_component_pixels": 2500
+    },
+    "equipped_slot_positions": [
+      {"label": "left_1", "x": 533, "y": 280},
+      {"label": "right_1", "x": 1058, "y": 280},
+      {"label": "left_2", "x": 533, "y": 463},
+      {"label": "right_2", "x": 1058, "y": 463},
+      {"label": "left_3", "x": 533, "y": 648},
+      {"label": "right_3", "x": 1058, "y": 648},
+      {"label": "left_4", "x": 533, "y": 833},
+      {"label": "right_4", "x": 1058, "y": 833},
+      {"label": "left_5", "x": 533, "y": 1018},
+      {"label": "right_5", "x": 1058, "y": 1018},
+      {"label": "left_6", "x": 533, "y": 1203},
+      {"label": "right_6", "x": 1058, "y": 1203}
+    ],
     "item_positions": [
       [160, 250],
       [160, 360],
