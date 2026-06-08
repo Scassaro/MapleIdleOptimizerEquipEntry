@@ -51,7 +51,7 @@ If `exec-out screencap` fails with `error: closed`, fix/restart the BlueStacks A
 
 Notes: 
 - All commands can be run with a "--dry-run" flag to just step through what will be performed without making changes on MIRPG (some dry runs work better than others at this point).
-- Some object titling may fail as OCR is flaky. A piece of gear may lack lvl in the name, but the script jut skips it.
+- Some object titling may fail as OCR is flaky. A piece of gear may lack level in the name, but the script just skips it if it can't find it.
 
 ## Submit Gear List
 
