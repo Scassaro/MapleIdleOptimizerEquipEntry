@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -85,7 +86,7 @@ EFFECT_LABEL_ALIASES = {
     "boss damage": "Boss Monster Damage",
     "boss monster damage": "Boss Monster Damage",
     "normal monster damage": "Normal Monster Damage",
-    "final damage": "Damage",
+    "final damage": "Final Damage",
     "damage": "Damage",
     "accuracy": "Accuracy",
     "hit chance": "Accuracy",
@@ -1154,7 +1155,7 @@ def require_mirpg_equipment_slot(parsed: dict[str, Any], website: dict[str, Any]
 def mirpg_applescript_payload(parsed: dict[str, Any], website: dict[str, Any] | None = None) -> dict[str, Any]:
     website = website or {}
     effects = [dict(effect) for effect in parsed.get("on_equip_effects", [])]
-    equipment_name = build_equipment_name(parsed) or parsed.get("equipment_name")
+    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed)
     if not equipment_name:
         raise AutomationError("Parsed item does not have an equipment_name.")
     if not effects:
@@ -2535,7 +2536,7 @@ def fill_mirpg_sub_options(editor: Any, effects: list[dict[str, Any]], website: 
 def submit_to_mirpg_optimizer(page: Any, parsed: dict[str, Any], config: dict[str, Any]) -> None:
     website = config.get("website", {})
     effects = [dict(effect) for effect in parsed.get("on_equip_effects", [])]
-    equipment_name = build_equipment_name(parsed) or parsed.get("equipment_name")
+    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed)
     if not equipment_name:
         raise AutomationError("Parsed item does not have an equipment_name.")
     if not effects:
@@ -5625,8 +5626,17 @@ def write_csv_log(csv_path: Path, rows: Iterable[dict[str, Any]]) -> None:
             writer.writerow(flat)
 
 
+def strip_generated_name_prefix(name: str) -> str:
+    return re.sub(r"^\s*\d+\s*-\s*", "", name).strip()
+
+
+def identity_equipment_name(parsed: dict[str, Any]) -> str:
+    name = parsed.get("base_equipment_name") or parsed.get("equipment_name") or build_equipment_name(parsed)
+    return strip_generated_name_prefix(str(name or ""))
+
+
 def equipment_identity_key(parsed: dict[str, Any]) -> str | None:
-    equipment_name = parsed.get("equipment_name") or build_equipment_name(parsed)
+    equipment_name = identity_equipment_name(parsed)
     effects = parsed.get("on_equip_effects", [])
     if not equipment_name or not isinstance(effects, list) or not effects:
         return None
@@ -5654,10 +5664,123 @@ def equipment_identity_key(parsed: dict[str, Any]) -> str | None:
     )
 
 
+def equipment_fingerprint(identity_key: str) -> str:
+    return hashlib.sha256(identity_key.encode("utf-8")).hexdigest()
+
+
+def equipment_dedupe_config(config: dict[str, Any]) -> dict[str, Any]:
+    value = config.get("dedupe_database", {})
+    return value if isinstance(value, dict) else {}
+
+
+class EquipmentDedupeDatabase:
+    def __init__(self, path: Path, *, load_into_memory: bool = True) -> None:
+        self.path = path.expanduser()
+        self.load_into_memory = load_into_memory
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.path)
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS equipment_seen (
+                fingerprint TEXT PRIMARY KEY,
+                identity_json TEXT NOT NULL,
+                equipment_name TEXT,
+                equipment_slot TEXT,
+                effects_json TEXT,
+                source TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                seen_count INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_equipment_seen_slot ON equipment_seen(equipment_slot)"
+        )
+        self.connection.commit()
+        self.fingerprints: set[str] | None = None
+        if self.load_into_memory:
+            self.fingerprints = {
+                str(row[0])
+                for row in self.connection.execute("SELECT fingerprint FROM equipment_seen")
+            }
+
+    def contains(self, identity_key: str | None) -> bool:
+        if not identity_key:
+            return False
+        fingerprint = equipment_fingerprint(identity_key)
+        if self.fingerprints is not None:
+            return fingerprint in self.fingerprints
+        cursor = self.connection.execute(
+            "SELECT 1 FROM equipment_seen WHERE fingerprint = ? LIMIT 1",
+            (fingerprint,),
+        )
+        return cursor.fetchone() is not None
+
+    def record(self, identity_key: str | None, parsed: dict[str, Any], source: str) -> None:
+        if not identity_key:
+            return
+        fingerprint = equipment_fingerprint(identity_key)
+        now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        effects = parsed.get("on_equip_effects", [])
+        effects_json = json.dumps(effects, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        self.connection.execute(
+            """
+            INSERT INTO equipment_seen (
+                fingerprint,
+                identity_json,
+                equipment_name,
+                equipment_slot,
+                effects_json,
+                source,
+                first_seen_at,
+                last_seen_at,
+                seen_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                seen_count = equipment_seen.seen_count + 1
+            """,
+            (
+                fingerprint,
+                identity_key,
+                identity_equipment_name(parsed),
+                parsed.get("equipment_slot"),
+                effects_json,
+                source,
+                now,
+                now,
+            ),
+        )
+        self.connection.commit()
+        if self.fingerprints is not None:
+            self.fingerprints.add(fingerprint)
+
+    def close(self) -> None:
+        self.connection.close()
+
+
+def open_equipment_dedupe_database(config: dict[str, Any], debug_dir: Path) -> EquipmentDedupeDatabase | None:
+    db_config = equipment_dedupe_config(config)
+    if not bool(db_config.get("enabled", False)):
+        return None
+
+    db_path_value = db_config.get("path") or "equipment_ocr_debug/equipment_seen.sqlite"
+    db_path = Path(str(db_path_value)).expanduser()
+    if not db_path.is_absolute():
+        db_path = Path.cwd() / db_path
+    load_into_memory = bool(db_config.get("load_into_memory", True))
+    db = EquipmentDedupeDatabase(db_path, load_into_memory=load_into_memory)
+    print(f"Persistent equipment duplicate DB: {db.path}")
+    return db
+
+
 def parsed_duplicate_status(
     parsed: dict[str, Any],
     seen_equipment_keys: set[str],
     config: dict[str, Any],
+    dedupe_db: EquipmentDedupeDatabase | None = None,
 ) -> tuple[str | None, str]:
     if not config.get("skip_duplicate_parsed_equipment", True):
         return None, ""
@@ -5667,7 +5790,31 @@ def parsed_duplicate_status(
         return None, ""
     if identity_key in seen_equipment_keys:
         return identity_key, "parsed_equipment"
+    if dedupe_db is not None and dedupe_db.contains(identity_key):
+        return identity_key, "persistent_equipment"
     return identity_key, ""
+
+
+def equipment_slot_counter_key(parsed: dict[str, Any]) -> str:
+    slot = str(parsed.get("equipment_slot") or "").strip()
+    return slot or "Unknown"
+
+
+def assign_numbered_equipment_name(
+    parsed: dict[str, Any],
+    slot_counts: dict[str, int],
+) -> int:
+    slot_key = equipment_slot_counter_key(parsed)
+    next_number = int(slot_counts.get(slot_key, 0)) + 1
+    slot_counts[slot_key] = next_number
+
+    base_name = str(parsed.get("equipment_name") or build_equipment_name(parsed) or "").strip()
+    if not base_name:
+        base_name = "(unknown item)"
+    parsed["base_equipment_name"] = base_name
+    parsed["equipment_type_count"] = next_number
+    parsed["equipment_name"] = f"{next_number} - {base_name}"
+    return next_number
 
 
 def default_reparse_output_path(ocr_path: Path) -> Path:
@@ -5982,25 +6129,27 @@ def record_and_maybe_submit_result(
     debug_dir: Path,
     dry_run: bool,
     seen_equipment_keys: set[str],
+    slot_counts: dict[str, int],
     csv_rows: list[dict[str, Any]],
     metadata: dict[str, Any],
+    dedupe_db: EquipmentDedupeDatabase | None = None,
 ) -> tuple[str | None, str, bool]:
-    identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+    identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config, dedupe_db)
     if duplicate_reason:
         print(
             f"Duplicate parsed equipment detected at item {result.index}; "
-            "skipping website submit."
+            f"skipping website submit ({duplicate_reason})."
         )
         submitted_or_new = False
-    elif not dry_run:
-        submit_result_to_configured_website(result, config, driver, page, debug_dir)
-        submitted_or_new = True
-        if identity_key:
-            seen_equipment_keys.add(identity_key)
     else:
+        assign_numbered_equipment_name(result.parsed, slot_counts)
+        if not dry_run:
+            submit_result_to_configured_website(result, config, driver, page, debug_dir)
         submitted_or_new = True
         if identity_key:
             seen_equipment_keys.add(identity_key)
+            if dedupe_db is not None and not dry_run:
+                dedupe_db.record(identity_key, result.parsed, str(metadata.get("flow") or "submit"))
 
     csv_rows.append(
         {
@@ -6008,6 +6157,7 @@ def record_and_maybe_submit_result(
             "index": result.index,
             "skipped_duplicate": bool(duplicate_reason),
             "duplicate_reason": duplicate_reason,
+            "dedupe_fingerprint": equipment_fingerprint(identity_key) if identity_key else "",
             **result.parsed,
         }
     )
@@ -6024,11 +6174,13 @@ def run_submit_manual_pages(
     snapshotter: MovementSnapshotter | None = None,
     page_limit: int | None = None,
     primary_only: bool = False,
+    dedupe_db: EquipmentDedupeDatabase | None = None,
 ) -> None:
     detect_config = detected_items_config(config)
     max_pages = page_limit if page_limit is not None else int(detect_config.get("max_all_pages", 200))
     click_delay = float(detect_config.get("manual_page_click_delay_seconds", 2.0))
     seen_equipment_keys: set[str] = set()
+    slot_counts: dict[str, int] = {}
     csv_rows: list[dict[str, Any]] = []
     total_processed = 0
     total_submitted = 0
@@ -6113,8 +6265,10 @@ def run_submit_manual_pages(
             debug_dir,
             dry_run,
             seen_equipment_keys,
+            slot_counts,
             csv_rows,
             {
+                "flow": "submit_gear_list",
                 "manual_page": page_index + 1,
                 "manual_selected": True,
                 "detected_card": 0,
@@ -6123,6 +6277,7 @@ def run_submit_manual_pages(
                 "tap_retry_discarded": False,
                 "tap_retry_count": 0,
             },
+            dedupe_db,
         )
         total_processed += 1
         if duplicate_reason:
@@ -6163,7 +6318,12 @@ def run_submit_manual_pages(
                 print_result(result)
                 total_processed += 1
 
-                identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+                identity_key, duplicate_reason = parsed_duplicate_status(
+                    result.parsed,
+                    seen_equipment_keys,
+                    config,
+                    dedupe_db,
+                )
                 should_retry = should_retry_unchanged_equipment_tap(
                     config,
                     identity_key,
@@ -6185,6 +6345,7 @@ def run_submit_manual_pages(
                     csv_rows.append(
                         {
                             "index": result_index,
+                            "flow": "submit_gear_list",
                             "manual_page": page_index + 1,
                             "manual_selected": False,
                             "detected_card": card_index,
@@ -6195,6 +6356,7 @@ def run_submit_manual_pages(
                             "retry_reason": "unchanged_equipment_after_tap",
                             "skipped_duplicate": bool(duplicate_reason),
                             "duplicate_reason": duplicate_reason,
+                            "dedupe_fingerprint": equipment_fingerprint(identity_key) if identity_key else "",
                             **result.parsed,
                         }
                     )
@@ -6214,8 +6376,10 @@ def run_submit_manual_pages(
                 debug_dir,
                 dry_run,
                 seen_equipment_keys,
+                slot_counts,
                 csv_rows,
                 {
+                    "flow": "submit_gear_list",
                     "manual_page": page_index + 1,
                     "manual_selected": False,
                     "detected_card": card_index,
@@ -6224,6 +6388,7 @@ def run_submit_manual_pages(
                     "tap_retry_discarded": False,
                     "tap_retry_count": retry_discarded,
                 },
+                dedupe_db,
             )
             if duplicate_reason:
                 page_duplicates += 1
@@ -6261,6 +6426,7 @@ def run_submit_equipped_slots(
     snapshotter: MovementSnapshotter | None = None,
     limit: int | None = None,
     manual_first: bool | None = None,
+    dedupe_db: EquipmentDedupeDatabase | None = None,
 ) -> None:
     slots = equipped_slot_positions(config)
     if not slots:
@@ -6272,6 +6438,7 @@ def run_submit_equipped_slots(
     if manual_first is None:
         manual_first = bool(config.get("advance", {}).get("equipped_slot_manual_first", True))
     seen_equipment_keys: set[str] = set()
+    slot_counts: dict[str, int] = {}
     csv_rows: list[dict[str, Any]] = []
     total_submitted = 0
     total_duplicates = 0
@@ -6339,8 +6506,10 @@ def run_submit_equipped_slots(
             debug_dir,
             dry_run,
             seen_equipment_keys,
+            slot_counts,
             csv_rows,
             {
+                "flow": "submit_equipped_slots",
                 "equipped_slot_index": 1,
                 "equipped_slot_label": first_slot["label"],
                 "equipped_slot_center": [first_slot["x"], first_slot["y"]],
@@ -6348,6 +6517,7 @@ def run_submit_equipped_slots(
                 "tap_offset": [round(offset[0], 1), round(offset[1], 1)],
                 "detected_click_center": detection.get("center") if detection else None,
             },
+            dedupe_db,
         )
         if duplicate_reason:
             total_duplicates += 1
@@ -6387,8 +6557,10 @@ def run_submit_equipped_slots(
             debug_dir,
             dry_run,
             seen_equipment_keys,
+            slot_counts,
             csv_rows,
             {
+                "flow": "submit_equipped_slots",
                 "equipped_slot_index": index + 1,
                 "equipped_slot_label": slot["label"],
                 "equipped_slot_center": [slot["x"], slot["y"]],
@@ -6396,6 +6568,7 @@ def run_submit_equipped_slots(
                 "tap_offset": [round(offset[0], 1), round(offset[1], 1)],
                 "manual_first_equipped_slot": False,
             },
+            dedupe_db,
         )
         if duplicate_reason:
             total_duplicates += 1
@@ -6421,12 +6594,14 @@ def run_submit_detected_all(
     page: Any = None,
     snapshotter: MovementSnapshotter | None = None,
     primary_only: bool = False,
+    dedupe_db: EquipmentDedupeDatabase | None = None,
 ) -> None:
     detect_config = detected_items_config(config)
     max_all_pages = int(detect_config.get("max_all_pages", 200))
     max_duplicate_pages = int(detect_config.get("max_duplicate_pages_before_stop", 3))
     seen_equipment_keys: set[str] = set()
     seen_card_signatures: list[dict[str, Any]] = []
+    slot_counts: dict[str, int] = {}
     previous_signed_boxes: list[dict[str, Any]] | None = None
     snap_target_rows: list[float] | None = None
     csv_rows: list[dict[str, Any]] = []
@@ -6526,7 +6701,12 @@ def run_submit_detected_all(
                 print_result(result)
                 total_clicked += 1
 
-                identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+                identity_key, duplicate_reason = parsed_duplicate_status(
+                    result.parsed,
+                    seen_equipment_keys,
+                    config,
+                    dedupe_db,
+                )
                 should_retry = should_retry_unchanged_equipment_tap(
                     config,
                     identity_key,
@@ -6548,6 +6728,7 @@ def run_submit_detected_all(
                     csv_rows.append(
                         {
                             "index": result_index,
+                            "flow": "submit_detected_all",
                             "detected_page": page_index + 1,
                             "detected_card": card_index,
                             "detected_card_label": detected_item_box_grid_label(box),
@@ -6557,6 +6738,7 @@ def run_submit_detected_all(
                             "retry_reason": "unchanged_equipment_after_tap",
                             "skipped_duplicate": bool(duplicate_reason),
                             "duplicate_reason": duplicate_reason,
+                            "dedupe_fingerprint": equipment_fingerprint(identity_key) if identity_key else "",
                             **result.parsed,
                         }
                     )
@@ -6573,19 +6755,18 @@ def run_submit_detected_all(
                 total_duplicates += 1
                 print(
                     f"Duplicate parsed equipment detected at clicked item {result_index}; "
-                    "skipping website submit."
+                    f"skipping website submit ({duplicate_reason})."
                 )
-            elif not dry_run:
-                submit_result_to_configured_website(result, config, driver, page, debug_dir)
-                page_submitted += 1
-                total_submitted += 1
-                if identity_key:
-                    seen_equipment_keys.add(identity_key)
             else:
+                assign_numbered_equipment_name(result.parsed, slot_counts)
                 page_submitted += 1
                 total_submitted += 1
+                if not dry_run:
+                    submit_result_to_configured_website(result, config, driver, page, debug_dir)
                 if identity_key:
                     seen_equipment_keys.add(identity_key)
+                    if dedupe_db is not None and not dry_run:
+                        dedupe_db.record(identity_key, result.parsed, "submit_detected_all")
 
             previous_observed_identity_key = identity_key or equipment_identity_key(result.parsed)
             previous_observed_image_hash = result.image_hash
@@ -6594,6 +6775,7 @@ def run_submit_detected_all(
             csv_rows.append(
                 {
                     "index": result_index,
+                    "flow": "submit_detected_all",
                     "detected_page": page_index + 1,
                     "detected_card": card_index,
                     "detected_card_label": detected_item_box_grid_label(box),
@@ -6602,6 +6784,7 @@ def run_submit_detected_all(
                     "tap_retry_count": retry_discarded,
                     "skipped_duplicate": bool(duplicate_reason),
                     "duplicate_reason": duplicate_reason,
+                    "dedupe_fingerprint": equipment_fingerprint(identity_key) if identity_key else "",
                     **result.parsed,
                 }
             )
@@ -6976,6 +7159,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_detected_all:
         driver = website_driver(config)
         pw = browser = page = None
+        dedupe_db = None
         close_browser = True
         if not args.dry_run:
             if driver == "chrome_applescript":
@@ -6984,6 +7168,7 @@ def main(argv: list[str] | None = None) -> int:
                 pw, browser, page, close_browser = load_playwright(config)
             else:
                 raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        dedupe_db = open_equipment_dedupe_database(config, debug_dir)
         snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
         try:
             run_submit_detected_all(
@@ -6995,9 +7180,12 @@ def main(argv: list[str] | None = None) -> int:
                 page,
                 snapshotter,
                 args.primary_only,
+                dedupe_db,
             )
         finally:
             finish_movement_snapshotter(snapshotter)
+            if dedupe_db is not None:
+                dedupe_db.close()
             if browser is not None and close_browser:
                 browser.close()
             if pw is not None:
@@ -7007,6 +7195,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_gear_list:
         driver = website_driver(config)
         pw = browser = page = None
+        dedupe_db = None
         close_browser = True
         if not args.dry_run:
             if driver == "chrome_applescript":
@@ -7015,6 +7204,7 @@ def main(argv: list[str] | None = None) -> int:
                 pw, browser, page, close_browser = load_playwright(config)
             else:
                 raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        dedupe_db = open_equipment_dedupe_database(config, debug_dir)
         snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
         try:
             manual_primary_only = not args.include_reference_regions
@@ -7028,9 +7218,12 @@ def main(argv: list[str] | None = None) -> int:
                 snapshotter,
                 args.manual_page_limit,
                 manual_primary_only,
+                dedupe_db,
             )
         finally:
             finish_movement_snapshotter(snapshotter)
+            if dedupe_db is not None:
+                dedupe_db.close()
             if browser is not None and close_browser:
                 browser.close()
             if pw is not None:
@@ -7040,6 +7233,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.submit_equipped_slots:
         driver = website_driver(config)
         pw = browser = page = None
+        dedupe_db = None
         close_browser = True
         if not args.dry_run:
             if driver == "chrome_applescript":
@@ -7048,6 +7242,7 @@ def main(argv: list[str] | None = None) -> int:
                 pw, browser, page, close_browser = load_playwright(config)
             else:
                 raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+        dedupe_db = open_equipment_dedupe_database(config, debug_dir)
         snapshotter = create_movement_snapshotter(debug_dir, config) if args.movement_snapshots else None
         try:
             run_submit_equipped_slots(
@@ -7060,9 +7255,12 @@ def main(argv: list[str] | None = None) -> int:
                 snapshotter,
                 args.equipped_slot_limit,
                 not args.no_equipped_manual_first,
+                dedupe_db,
             )
         finally:
             finish_movement_snapshotter(snapshotter)
+            if dedupe_db is not None:
+                dedupe_db.close()
             if browser is not None and close_browser:
                 browser.close()
             if pw is not None:
@@ -7131,6 +7329,7 @@ def main(argv: list[str] | None = None) -> int:
 
     driver = website_driver(config)
     pw = browser = page = None
+    dedupe_db = None
     close_browser = True
     if not args.dry_run:
         if driver == "chrome_applescript":
@@ -7139,9 +7338,11 @@ def main(argv: list[str] | None = None) -> int:
             pw, browser, page, close_browser = load_playwright(config)
         else:
             raise AutomationError("website.driver must be one of: chrome_applescript, playwright")
+    dedupe_db = open_equipment_dedupe_database(config, debug_dir)
 
     seen_hashes: set[str] = set()
     seen_equipment_keys: set[str] = set()
+    slot_counts: dict[str, int] = {}
     csv_rows: list[dict[str, Any]] = []
 
     try:
@@ -7156,18 +7357,27 @@ def main(argv: list[str] | None = None) -> int:
                     break
                 seen_hashes.add(result.image_hash)
 
-            identity_key, duplicate_reason = parsed_duplicate_status(result.parsed, seen_equipment_keys, config)
+            identity_key, duplicate_reason = parsed_duplicate_status(
+                result.parsed,
+                seen_equipment_keys,
+                config,
+                dedupe_db,
+            )
             if duplicate_reason:
                 print(
                     f"Duplicate parsed equipment detected at item {index}; "
-                    "skipping website submit and advancing."
+                    f"skipping website submit and advancing ({duplicate_reason})."
                 )
+            else:
+                assign_numbered_equipment_name(result.parsed, slot_counts)
 
             csv_rows.append(
                 {
                     "index": index,
+                    "flow": "limit_submit",
                     "skipped_duplicate": bool(duplicate_reason),
                     "duplicate_reason": duplicate_reason,
+                    "dedupe_fingerprint": equipment_fingerprint(identity_key) if identity_key else "",
                     **result.parsed,
                 }
             )
@@ -7198,6 +7408,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 if identity_key:
                     seen_equipment_keys.add(identity_key)
+                    if dedupe_db is not None:
+                        dedupe_db.record(identity_key, result.parsed, "limit_submit")
             elif identity_key:
                 seen_equipment_keys.add(identity_key)
 
@@ -7207,6 +7419,8 @@ def main(argv: list[str] | None = None) -> int:
         write_csv_log(csv_log, csv_rows)
         print(f"\nParsed CSV log: {csv_log}")
     finally:
+        if dedupe_db is not None:
+            dedupe_db.close()
         if browser is not None and close_browser:
             browser.close()
         if pw is not None:

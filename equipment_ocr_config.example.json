@@ -7,6 +7,11 @@
   },
   "stop_on_duplicate_image": false,
   "skip_duplicate_parsed_equipment": true,
+  "dedupe_database": {
+    "enabled": true,
+    "path": "equipment_ocr_debug/equipment_seen.sqlite",
+    "load_into_memory": true
+  },
   "capture": {
     "backend": "adb",
     "adb_path": "adb",
