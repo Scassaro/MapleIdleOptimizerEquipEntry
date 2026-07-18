@@ -1,36 +1,6 @@
 # MIRPG Equipment OCR Runner
 
-Condensed setup, file list, and run commands for `equipment_ocr_submitter.py`.
-
-## Minimum Files
-
-To run the automation on another machine, copy:
-
-```text
-equipment_ocr_submitter.py
-equipment_ocr_config.example.json
-requirements-equipment-automation.txt
-README.md
-```
-
-Optional for validation:
-
-```text
-test_equipment_ocr_submitter.py
-```
-
-Do not copy generated files:
-
-```text
-.venv/
-equipment_ocr_debug/
-__pycache__/
-*.sqlite
-*.png
-*.csv
-```
-
-## macOS Install
+## Install
 
 ```bash
 python3 -m venv .venv
